@@ -30,6 +30,7 @@
 #include <aclnnop/aclnn_copy.h>
 #include <aclnnop/aclnn_cos.h>
 #include <aclnnop/aclnn_div.h>
+#include <aclnnop/aclnn_embedding.h>
 #include <aclnnop/aclnn_exp.h>
 #include <aclnnop/aclnn_fill_scalar.h>
 #include <aclnnop/aclnn_group_norm.h>
@@ -2382,22 +2383,6 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     ggml_tensor* src0 = dst->src[0];
     ggml_tensor* src1 = dst->src[1];
 
-    ggml_cann_pool_alloc src0_extra_allocator(ctx.pool(), sizeof(ggml_tensor));
-    ggml_cann_pool_alloc src1_extra_allocator(ctx.pool(), sizeof(ggml_tensor));
-    ggml_cann_pool_alloc dst_extra_allocator(ctx.pool(), sizeof(ggml_tensor));
-    src0->extra = src0_extra_allocator.get();
-    src1->extra = src1_extra_allocator.get();
-    dst->extra = dst_extra_allocator.get();
-    ACL_CHECK(aclrtMemcpyAsync(src0->extra, sizeof(ggml_tensor), src0,
-                               sizeof(ggml_tensor), ACL_MEMCPY_HOST_TO_DEVICE,
-                               ctx.stream()));
-    ACL_CHECK(aclrtMemcpyAsync(src1->extra, sizeof(ggml_tensor), src1,
-                               sizeof(ggml_tensor), ACL_MEMCPY_HOST_TO_DEVICE,
-                               ctx.stream()));
-    ACL_CHECK(aclrtMemcpyAsync(dst->extra, sizeof(ggml_tensor), dst,
-                               sizeof(ggml_tensor), ACL_MEMCPY_HOST_TO_DEVICE,
-                               ctx.stream()));
-
     switch (src0->type) {
         case GGML_TYPE_F32: {
 #ifdef ASCEND_310P
@@ -2409,13 +2394,58 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                 ACL_CHECK(aclrtMemset((char*)dst->data, dst_len, 0, dst_len));
             }
 #endif
-            aclrtlaunch_ascendc_get_row_f32(
-                24, ctx.stream(), src0->data, src1->data, dst->data,
-                ((ggml_tensor*)src0->extra)->ne,
-                ((ggml_tensor*)src0->extra)->nb,
-                ((ggml_tensor*)src1->extra)->ne,
-                ((ggml_tensor*)src1->extra)->nb, ((ggml_tensor*)dst->extra)->ne,
-                ((ggml_tensor*)dst->extra)->nb);
+            int64_t fir = src0->ne[3];
+            int64_t sec = src0->ne[2];
+            int64_t rows = src0->ne[1];
+            int64_t num = src0->ne[0];
+            for (int64_t i = 0; i < fir; i++) {
+                for (int64_t j = 0; j < sec; j++) {
+                    // src
+                    int64_t acl_src_ne[2] = {num, rows};
+                    size_t acl_src_nb[2] = {src0->nb[0], src0->nb[1]};
+                    aclTensor* acl_src = ggml_cann_create_tensor(
+                        (char*)src0->data + i * src0->nb[3] + j * src0->nb[2],
+                        ggml_cann_type_mapping(src0->type),
+                        ggml_element_size(src0), acl_src_ne, acl_src_nb, 2);
+
+                    // index
+                    int64_t acl_index_ne[1] = {src1->ne[0]};
+                    size_t acl_index_nb[1] = {src1->nb[0]};
+                    aclTensor* acl_index = ggml_cann_create_tensor(
+                        (char*)src1->data + i * src1->nb[2] + j * src1->nb[1],
+                        ggml_cann_type_mapping(src1->type),
+                        ggml_element_size(src1), acl_index_ne, acl_index_nb, 1);
+
+                    // out
+                    int64_t acl_out_ne[2] = {dst->ne[0], dst->ne[1]};
+                    size_t acl_out_nb[2] = {dst->nb[0], dst->nb[1]};
+                    aclTensor* acl_out = ggml_cann_create_tensor(
+                        (char*)dst->data + i * dst->nb[3] + j * dst->nb[2],
+                        ggml_cann_type_mapping(dst->type),
+                        ggml_element_size(dst), acl_out_ne, acl_out_nb, 2);
+
+                    uint64_t workspaceSize = 0;
+                    aclOpExecutor* executor;
+                    void* workspaceAddr = nullptr;
+
+                    ACL_CHECK(aclnnEmbeddingGetWorkspaceSize(
+                        acl_src, acl_index, acl_out, &workspaceSize,
+                        &executor));
+
+                    if (workspaceSize > 0) {
+                        ggml_cann_pool_alloc workspace_allocator(ctx.pool(),
+                                                                 workspaceSize);
+                        workspaceAddr = workspace_allocator.get();
+                    }
+
+                    ACL_CHECK(aclnnEmbedding(workspaceAddr, workspaceSize,
+                                             executor, ctx.stream()));
+
+                    ACL_CHECK(aclDestroyTensor(acl_src));
+                    ACL_CHECK(aclDestroyTensor(acl_index));
+                    ACL_CHECK(aclDestroyTensor(acl_out));
+                }
+            }
             break;
         }
         case GGML_TYPE_F16: {
@@ -2430,16 +2460,113 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                 ACL_CHECK(aclrtMemset((char*)dst->data, dst_len, 0, dst_len));
             }
 #endif
-            aclrtlaunch_ascendc_get_row_f16(
-                24, ctx.stream(), src0->data, src1->data, dst->data,
-                ((ggml_tensor*)src0->extra)->ne,
-                ((ggml_tensor*)src0->extra)->nb,
-                ((ggml_tensor*)src1->extra)->ne,
-                ((ggml_tensor*)src1->extra)->nb, ((ggml_tensor*)dst->extra)->ne,
-                ((ggml_tensor*)dst->extra)->nb);
+            aclTensor* acl_src0 = ggml_cann_create_tensor(src0);
+            ggml_cann_pool_alloc src_buffer_allocator(
+                ctx.pool(), ggml_nelements(dst) * sizeof(float_t));
+            void* src_f32_buffer = src_buffer_allocator.get();
+            size_t src_f32_nb[GGML_MAX_DIMS];
+            src_f32_nb[0] = sizeof(float_t);
+            for (int i = 1; i < GGML_MAX_DIMS; i++) {
+                src_f32_nb[i] = src_f32_nb[i - 1] * src0->ne[i - 1];
+            }
+            aclTensor* src_f32_tensor = ggml_cann_create_tensor(
+                src_f32_buffer, ACL_FLOAT, ggml_type_size(dst->type), src0->ne,
+                src_f32_nb, GGML_MAX_DIMS);
+
+            uint64_t castWorkspaceSize = 0;
+            aclOpExecutor* castExecutor;
+            void* castWorkspaceAddr = nullptr;
+
+            ACL_CHECK(
+                aclnnCastGetWorkspaceSize(acl_src0, ACL_FLOAT, src_f32_tensor,
+                                          &castWorkspaceSize, &castExecutor));
+
+            if (castWorkspaceSize > 0) {
+                ggml_cann_pool_alloc workspace_allocator(ctx.pool(),
+                                                         castWorkspaceSize);
+                castWorkspaceAddr = workspace_allocator.get();
+            }
+
+            ACL_CHECK(aclnnCast(castWorkspaceAddr, castWorkspaceSize,
+                                castExecutor, ctx.stream()));
+
+            int64_t fir = src0->ne[3];
+            int64_t sec = src0->ne[2];
+            int64_t rows = src0->ne[1];
+            int64_t num = src0->ne[0];
+            for (int64_t i = 0; i < fir; i++) {
+                for (int64_t j = 0; j < sec; j++) {
+                    // src
+                    int64_t acl_src_ne[2] = {num, rows};
+                    size_t acl_src_nb[2] = {src_f32_nb[0], src_f32_nb[1]};
+                    aclTensor* acl_src = ggml_cann_create_tensor(
+                        (char*)src_f32_buffer + i * src_f32_nb[3] +
+                            j * src_f32_nb[2],
+                        ggml_cann_type_mapping(dst->type),
+                        ggml_element_size(dst), acl_src_ne, acl_src_nb, 2);
+
+                    // index
+                    int64_t acl_index_ne[1] = {src1->ne[0]};
+                    size_t acl_index_nb[1] = {src1->nb[0]};
+                    aclTensor* acl_index = ggml_cann_create_tensor(
+                        (char*)src1->data + i * src1->nb[2] + j * src1->nb[1],
+                        ggml_cann_type_mapping(src1->type),
+                        ggml_element_size(src1), acl_index_ne, acl_index_nb, 1);
+
+                    // out
+                    int64_t acl_out_ne[2] = {dst->ne[0], dst->ne[1]};
+                    size_t acl_out_nb[2] = {dst->nb[0], dst->nb[1]};
+                    aclTensor* acl_out = ggml_cann_create_tensor(
+                        (char*)dst->data + i * dst->nb[3] + j * dst->nb[2],
+                        ggml_cann_type_mapping(dst->type),
+                        ggml_element_size(dst), acl_out_ne, acl_out_nb, 2);
+
+                    uint64_t workspaceSize = 0;
+                    aclOpExecutor* executor;
+                    void* workspaceAddr = nullptr;
+
+                    ACL_CHECK(aclnnEmbeddingGetWorkspaceSize(
+                        acl_src, acl_index, acl_out, &workspaceSize,
+                        &executor));
+
+                    if (workspaceSize > 0) {
+                        ggml_cann_pool_alloc workspace_allocator(ctx.pool(),
+                                                                 workspaceSize);
+                        workspaceAddr = workspace_allocator.get();
+                    }
+
+                    ACL_CHECK(aclnnEmbedding(workspaceAddr, workspaceSize,
+                                             executor, ctx.stream()));
+
+                    ACL_CHECK(aclDestroyTensor(acl_src));
+                    ACL_CHECK(aclDestroyTensor(acl_index));
+                    ACL_CHECK(aclDestroyTensor(acl_out));
+                }
+            }
+            ACL_CHECK(aclDestroyTensor(acl_src0));
+            ACL_CHECK(aclDestroyTensor(src_f32_tensor));
             break;
         }
-        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_0: {
+            ggml_cann_pool_alloc src0_extra_allocator(ctx.pool(),
+                                                      sizeof(ggml_tensor));
+            ggml_cann_pool_alloc src1_extra_allocator(ctx.pool(),
+                                                      sizeof(ggml_tensor));
+            ggml_cann_pool_alloc dst_extra_allocator(ctx.pool(),
+                                                     sizeof(ggml_tensor));
+            src0->extra = src0_extra_allocator.get();
+            src1->extra = src1_extra_allocator.get();
+            dst->extra = dst_extra_allocator.get();
+            ACL_CHECK(aclrtMemcpyAsync(
+                src0->extra, sizeof(ggml_tensor), src0, sizeof(ggml_tensor),
+                ACL_MEMCPY_HOST_TO_DEVICE, ctx.stream()));
+            ACL_CHECK(aclrtMemcpyAsync(
+                src1->extra, sizeof(ggml_tensor), src1, sizeof(ggml_tensor),
+                ACL_MEMCPY_HOST_TO_DEVICE, ctx.stream()));
+            ACL_CHECK(aclrtMemcpyAsync(
+                dst->extra, sizeof(ggml_tensor), dst, sizeof(ggml_tensor),
+                ACL_MEMCPY_HOST_TO_DEVICE, ctx.stream()));
+
             aclrtlaunch_ascendc_get_row_q4_0(
                 24, ctx.stream(), src0->data, src1->data, dst->data,
                 ((ggml_tensor*)src0->extra)->ne,
@@ -2447,7 +2574,27 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                 ((ggml_tensor*)src1->extra)->nb, ((ggml_tensor*)dst->extra)->ne,
                 ((ggml_tensor*)dst->extra)->nb);
             break;
-        case GGML_TYPE_Q8_0:
+        }
+        case GGML_TYPE_Q8_0: {
+            ggml_cann_pool_alloc src0_extra_allocator(ctx.pool(),
+                                                      sizeof(ggml_tensor));
+            ggml_cann_pool_alloc src1_extra_allocator(ctx.pool(),
+                                                      sizeof(ggml_tensor));
+            ggml_cann_pool_alloc dst_extra_allocator(ctx.pool(),
+                                                     sizeof(ggml_tensor));
+            src0->extra = src0_extra_allocator.get();
+            src1->extra = src1_extra_allocator.get();
+            dst->extra = dst_extra_allocator.get();
+            ACL_CHECK(aclrtMemcpyAsync(
+                src0->extra, sizeof(ggml_tensor), src0, sizeof(ggml_tensor),
+                ACL_MEMCPY_HOST_TO_DEVICE, ctx.stream()));
+            ACL_CHECK(aclrtMemcpyAsync(
+                src1->extra, sizeof(ggml_tensor), src1, sizeof(ggml_tensor),
+                ACL_MEMCPY_HOST_TO_DEVICE, ctx.stream()));
+            ACL_CHECK(aclrtMemcpyAsync(
+                dst->extra, sizeof(ggml_tensor), dst, sizeof(ggml_tensor),
+                ACL_MEMCPY_HOST_TO_DEVICE, ctx.stream()));
+
             aclrtlaunch_ascendc_get_row_q8_0(
                 24, ctx.stream(), src0->data, src1->data, dst->data,
                 ((ggml_tensor*)src0->extra)->ne,
@@ -2455,6 +2602,7 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                 ((ggml_tensor*)src1->extra)->nb, ((ggml_tensor*)dst->extra)->ne,
                 ((ggml_tensor*)dst->extra)->nb);
             break;
+        }
         default:
             GGML_ABORT("fatal error");
             break;
@@ -2797,8 +2945,8 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
 
             ACL_CHECK(aclnnWeightQuantBatchMatmulV2GetWorkspaceSize(
                 acl_input_tensor, acl_weight_tensor, acl_scale_tensor, nullptr,
-                nullptr, nullptr, nullptr, antiquantGroupSize, acl_output_tensor,
-                &workspaceSize, &executor));
+                nullptr, nullptr, nullptr, antiquantGroupSize,
+                acl_output_tensor, &workspaceSize, &executor));
             if (workspaceAddr == nullptr) {
                 workspaceAddr = workspace_allocator.alloc(workspaceSize);
             }
