@@ -100,6 +100,24 @@ static void aclnn_repeat(ggml_backend_cann_context& ctx, aclTensor* acl_src,
     ACL_CHECK(aclDestroyIntArray(repeats));
 }
 
+void ggml_cann_cast(ggml_backend_cann_context& ctx, aclTensor* acl_src,
+                    aclTensor* acl_dst, ggml_tensor* dst) {
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor;
+    void* workspaceAddr = nullptr;
+    ACL_CHECK(aclnnCastGetWorkspaceSize(acl_src,
+                                        ggml_cann_type_mapping(dst->type),
+                                        acl_dst, &workspaceSize, &executor));
+
+    if (workspaceSize > 0) {
+        ggml_cann_pool_alloc workspace_allocator(ctx.pool(), workspaceSize);
+        workspaceAddr = workspace_allocator.get();
+    }
+
+    ACL_CHECK(
+        aclnnCast(workspaceAddr, workspaceSize, executor, ctx.stream()));
+}
+
 void ggml_cann_repeat(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     ggml_tensor* src = dst->src[0];
     GGML_ASSERT(ggml_can_repeat(src, dst));
@@ -944,8 +962,7 @@ void ggml_cann_dup(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     if (ggml_is_contiguous(src) && ggml_is_contiguous(dst)) {
         if (dst->type == src->type) {
             size_t cpy_size = ggml_nbytes(dst);
-            ACL_CHECK(aclrtMemcpyAsync(dst->data, cpy_size, src->data,
-            cpy_size,
+            ACL_CHECK(aclrtMemcpyAsync(dst->data, cpy_size, src->data, cpy_size,
                                        ACL_MEMCPY_DEVICE_TO_DEVICE,
                                        ctx.stream()));
             return;
@@ -962,8 +979,7 @@ void ggml_cann_dup(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
             }
             aclTensor* src_trans_tensor = ggml_cann_create_tensor(
                 src_f32_buffer, ggml_cann_type_mapping(dst->type),
-                ggml_type_size(dst->type), src->ne, src_f32_nb,
-                GGML_MAX_DIMS);
+                ggml_type_size(dst->type), src->ne, src_f32_nb, GGML_MAX_DIMS);
 
             uint64_t castWorkspaceSize = 0;
             aclOpExecutor* castExecutor;
@@ -1028,8 +1044,7 @@ void ggml_cann_dup(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
             }
             aclTensor* src_trans_tensor = ggml_cann_create_tensor(
                 src_f32_buffer, ggml_cann_type_mapping(dst->type),
-                ggml_type_size(dst->type), src->ne, src_f32_nb,
-                GGML_MAX_DIMS);
+                ggml_type_size(dst->type), src->ne, src_f32_nb, GGML_MAX_DIMS);
 
             uint64_t castWorkspaceSize = 0;
             aclOpExecutor* castExecutor;
@@ -1090,8 +1105,7 @@ void ggml_cann_dup(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
             }
             aclTensor* src_trans_tensor = ggml_cann_create_tensor(
                 src_f32_buffer, ggml_cann_type_mapping(dst->type),
-                ggml_type_size(dst->type), src->ne, src_f32_nb,
-                GGML_MAX_DIMS);
+                ggml_type_size(dst->type), src->ne, src_f32_nb, GGML_MAX_DIMS);
 
             uint64_t castWorkspaceSize = 0;
             aclOpExecutor* castExecutor;
@@ -1130,8 +1144,7 @@ void ggml_cann_dup(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
             }
             aclTensor* src_trans_tensor = ggml_cann_create_tensor(
                 src_f32_buffer, ggml_cann_type_mapping(dst->type),
-                ggml_type_size(dst->type), src->ne, src_f32_nb,
-                GGML_MAX_DIMS);
+                ggml_type_size(dst->type), src->ne, src_f32_nb, GGML_MAX_DIMS);
 
             uint64_t castWorkspaceSize = 0;
             aclOpExecutor* castExecutor;
@@ -1201,14 +1214,16 @@ void ggml_cann_dup(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
         if (dst->type == GGML_TYPE_Q8_0) {
             // aclrtlaunch_ascendc_quantize_f16_q8_0(
             //     24, ctx.stream(), src->data, dst->data,
-            //     ((ggml_tensor*)src->extra)->ne, ((ggml_tensor*)src->extra)->nb,
+            //     ((ggml_tensor*)src->extra)->ne,
+            //     ((ggml_tensor*)src->extra)->nb,
             //     ((ggml_tensor*)dst->extra)->ne);
             return;
         }
         if (dst->type == GGML_TYPE_Q4_0) {
             // aclrtlaunch_ascendc_quantize_f16_to_q4_0(
             //     24, ctx.stream(), src->data, dst->data,
-            //     ((ggml_tensor*)src->extra)->ne, ((ggml_tensor*)src->extra)->nb,
+            //     ((ggml_tensor*)src->extra)->ne,
+            //     ((ggml_tensor*)src->extra)->nb,
             //     ((ggml_tensor*)dst->extra)->ne);
             return;
         }
@@ -1269,14 +1284,16 @@ void ggml_cann_dup(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
         if (dst->type == GGML_TYPE_Q8_0) {
             // aclrtlaunch_ascendc_quantize_f32_q8_0(
             //     24, ctx.stream(), src->data, dst->data,
-            //     ((ggml_tensor*)src->extra)->ne, ((ggml_tensor*)src->extra)->nb,
+            //     ((ggml_tensor*)src->extra)->ne,
+            //     ((ggml_tensor*)src->extra)->nb,
             //     ((ggml_tensor*)dst->extra)->ne);
             return;
         }
         if (dst->type == GGML_TYPE_Q4_0) {
             // aclrtlaunch_ascendc_quantize_f32_to_q4_0(
             //     24, ctx.stream(), src->data, dst->data,
-            //     ((ggml_tensor*)src->extra)->ne, ((ggml_tensor*)src->extra)->nb,
+            //     ((ggml_tensor*)src->extra)->ne,
+            //     ((ggml_tensor*)src->extra)->nb,
             //     ((ggml_tensor*)dst->extra)->ne);
             return;
         }
@@ -2662,9 +2679,61 @@ void ggml_cann_softmax(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     ACL_CHECK(aclDestroyTensor(tmp_mask_tensor));
 }
 
+void ggml_cann_embedding_4d(ggml_backend_cann_context& ctx, void* src_buffer,
+                            int64_t* src_ne, size_t* src_nb, ggml_tensor* index,
+                            ggml_tensor* dst) {
+    for (int64_t i = 0; i < src_ne[3]; i++) {
+        for (int64_t j = 0; j < src_ne[2]; j++) {
+            // src
+            int64_t acl_src_ne[2] = {src_ne[0], src_ne[1]};
+            size_t acl_src_nb[2] = {src_nb[0], src_nb[1]};
+            aclTensor* acl_src_tensor = ggml_cann_create_tensor(
+                (char*)src_buffer + i * src_nb[3] + j * src_nb[2],
+                ggml_cann_type_mapping(dst->type), ggml_element_size(dst),
+                acl_src_ne, acl_src_nb, 2);
+
+            // index
+            int64_t acl_index_ne[1] = {index->ne[0]};
+            size_t acl_index_nb[1] = {index->nb[0]};
+            aclTensor* acl_index = ggml_cann_create_tensor(
+                (char*)index->data + i * index->nb[2] + j * index->nb[1],
+                ggml_cann_type_mapping(index->type), ggml_element_size(index),
+                acl_index_ne, acl_index_nb, 1);
+
+            // out
+            int64_t acl_out_ne[2] = {dst->ne[0], dst->ne[1]};
+            size_t acl_out_nb[2] = {dst->nb[0], dst->nb[1]};
+            aclTensor* acl_out = ggml_cann_create_tensor(
+                (char*)dst->data + i * dst->nb[3] + j * dst->nb[2],
+                ggml_cann_type_mapping(dst->type), ggml_element_size(dst),
+                acl_out_ne, acl_out_nb, 2);
+
+            uint64_t workspaceSize = 0;
+            aclOpExecutor* executor;
+            void* workspaceAddr = nullptr;
+
+            ACL_CHECK(aclnnEmbeddingGetWorkspaceSize(
+                acl_src_tensor, acl_index, acl_out, &workspaceSize, &executor));
+
+            if (workspaceSize > 0) {
+                ggml_cann_pool_alloc workspace_allocator(ctx.pool(),
+                                                         workspaceSize);
+                workspaceAddr = workspace_allocator.get();
+            }
+
+            ACL_CHECK(aclnnEmbedding(workspaceAddr, workspaceSize, executor,
+                                     ctx.stream()));
+
+            ACL_CHECK(aclDestroyTensor(acl_src_tensor));
+            ACL_CHECK(aclDestroyTensor(acl_index));
+            ACL_CHECK(aclDestroyTensor(acl_out));
+        }
+    }
+}
+
 void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
-    ggml_tensor* src0 = dst->src[0];
-    ggml_tensor* src1 = dst->src[1];
+    ggml_tensor* src0 = dst->src[0]; // src
+    ggml_tensor* src1 = dst->src[1]; // index
 
     switch (src0->type) {
         case GGML_TYPE_F32: {
@@ -2677,58 +2746,8 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                 ACL_CHECK(aclrtMemset((char*)dst->data, dst_len, 0, dst_len));
             }
 #endif
-            int64_t fir = src0->ne[3];
-            int64_t sec = src0->ne[2];
-            int64_t rows = src0->ne[1];
-            int64_t num = src0->ne[0];
-            for (int64_t i = 0; i < fir; i++) {
-                for (int64_t j = 0; j < sec; j++) {
-                    // src
-                    int64_t acl_src_ne[2] = {num, rows};
-                    size_t acl_src_nb[2] = {src0->nb[0], src0->nb[1]};
-                    aclTensor* acl_src = ggml_cann_create_tensor(
-                        (char*)src0->data + i * src0->nb[3] + j * src0->nb[2],
-                        ggml_cann_type_mapping(src0->type),
-                        ggml_element_size(src0), acl_src_ne, acl_src_nb, 2);
-
-                    // index
-                    int64_t acl_index_ne[1] = {src1->ne[0]};
-                    size_t acl_index_nb[1] = {src1->nb[0]};
-                    aclTensor* acl_index = ggml_cann_create_tensor(
-                        (char*)src1->data + i * src1->nb[2] + j * src1->nb[1],
-                        ggml_cann_type_mapping(src1->type),
-                        ggml_element_size(src1), acl_index_ne, acl_index_nb, 1);
-
-                    // out
-                    int64_t acl_out_ne[2] = {dst->ne[0], dst->ne[1]};
-                    size_t acl_out_nb[2] = {dst->nb[0], dst->nb[1]};
-                    aclTensor* acl_out = ggml_cann_create_tensor(
-                        (char*)dst->data + i * dst->nb[3] + j * dst->nb[2],
-                        ggml_cann_type_mapping(dst->type),
-                        ggml_element_size(dst), acl_out_ne, acl_out_nb, 2);
-
-                    uint64_t workspaceSize = 0;
-                    aclOpExecutor* executor;
-                    void* workspaceAddr = nullptr;
-
-                    ACL_CHECK(aclnnEmbeddingGetWorkspaceSize(
-                        acl_src, acl_index, acl_out, &workspaceSize,
-                        &executor));
-
-                    if (workspaceSize > 0) {
-                        ggml_cann_pool_alloc workspace_allocator(ctx.pool(),
-                                                                 workspaceSize);
-                        workspaceAddr = workspace_allocator.get();
-                    }
-
-                    ACL_CHECK(aclnnEmbedding(workspaceAddr, workspaceSize,
-                                             executor, ctx.stream()));
-
-                    ACL_CHECK(aclDestroyTensor(acl_src));
-                    ACL_CHECK(aclDestroyTensor(acl_index));
-                    ACL_CHECK(aclDestroyTensor(acl_out));
-                }
-            }
+            ggml_cann_embedding_4d(ctx, src0->data, src0->ne, src0->nb, src1,
+                                   dst);
             break;
         }
         case GGML_TYPE_F16: {
@@ -2755,77 +2774,9 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
             aclTensor* src_trans_tensor = ggml_cann_create_tensor(
                 src_f32_buffer, ACL_FLOAT, ggml_type_size(dst->type), src0->ne,
                 src_f32_nb, GGML_MAX_DIMS);
-
-            uint64_t castWorkspaceSize = 0;
-            aclOpExecutor* castExecutor;
-            void* castWorkspaceAddr = nullptr;
-
-            ACL_CHECK(
-                aclnnCastGetWorkspaceSize(acl_src0, ACL_FLOAT, src_trans_tensor,
-                                          &castWorkspaceSize, &castExecutor));
-
-            if (castWorkspaceSize > 0) {
-                ggml_cann_pool_alloc workspace_allocator(ctx.pool(),
-                                                         castWorkspaceSize);
-                castWorkspaceAddr = workspace_allocator.get();
-            }
-
-            ACL_CHECK(aclnnCast(castWorkspaceAddr, castWorkspaceSize,
-                                castExecutor, ctx.stream()));
-
-            int64_t fir = src0->ne[3];
-            int64_t sec = src0->ne[2];
-            int64_t rows = src0->ne[1];
-            int64_t num = src0->ne[0];
-            for (int64_t i = 0; i < fir; i++) {
-                for (int64_t j = 0; j < sec; j++) {
-                    // src
-                    int64_t acl_src_ne[2] = {num, rows};
-                    size_t acl_src_nb[2] = {src_f32_nb[0], src_f32_nb[1]};
-                    aclTensor* acl_src = ggml_cann_create_tensor(
-                        (char*)src_f32_buffer + i * src_f32_nb[3] +
-                            j * src_f32_nb[2],
-                        ggml_cann_type_mapping(dst->type),
-                        ggml_element_size(dst), acl_src_ne, acl_src_nb, 2);
-
-                    // index
-                    int64_t acl_index_ne[1] = {src1->ne[0]};
-                    size_t acl_index_nb[1] = {src1->nb[0]};
-                    aclTensor* acl_index = ggml_cann_create_tensor(
-                        (char*)src1->data + i * src1->nb[2] + j * src1->nb[1],
-                        ggml_cann_type_mapping(src1->type),
-                        ggml_element_size(src1), acl_index_ne, acl_index_nb, 1);
-
-                    // out
-                    int64_t acl_out_ne[2] = {dst->ne[0], dst->ne[1]};
-                    size_t acl_out_nb[2] = {dst->nb[0], dst->nb[1]};
-                    aclTensor* acl_out = ggml_cann_create_tensor(
-                        (char*)dst->data + i * dst->nb[3] + j * dst->nb[2],
-                        ggml_cann_type_mapping(dst->type),
-                        ggml_element_size(dst), acl_out_ne, acl_out_nb, 2);
-
-                    uint64_t workspaceSize = 0;
-                    aclOpExecutor* executor;
-                    void* workspaceAddr = nullptr;
-
-                    ACL_CHECK(aclnnEmbeddingGetWorkspaceSize(
-                        acl_src, acl_index, acl_out, &workspaceSize,
-                        &executor));
-
-                    if (workspaceSize > 0) {
-                        ggml_cann_pool_alloc workspace_allocator(ctx.pool(),
-                                                                 workspaceSize);
-                        workspaceAddr = workspace_allocator.get();
-                    }
-
-                    ACL_CHECK(aclnnEmbedding(workspaceAddr, workspaceSize,
-                                             executor, ctx.stream()));
-
-                    ACL_CHECK(aclDestroyTensor(acl_src));
-                    ACL_CHECK(aclDestroyTensor(acl_index));
-                    ACL_CHECK(aclDestroyTensor(acl_out));
-                }
-            }
+            ggml_cann_cast(ctx, acl_src0, src_trans_tensor, dst);
+            ggml_cann_embedding_4d(ctx, src_f32_buffer, src0->ne, src_f32_nb,
+                                   src1, dst);
             ACL_CHECK(aclDestroyTensor(acl_src0));
             ACL_CHECK(aclDestroyTensor(src_trans_tensor));
             break;
@@ -2854,7 +2805,8 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
             //     24, ctx.stream(), src0->data, src1->data, dst->data,
             //     ((ggml_tensor*)src0->extra)->ne,
             //     ((ggml_tensor*)src1->extra)->ne,
-            //     ((ggml_tensor*)src1->extra)->nb, ((ggml_tensor*)dst->extra)->ne,
+            //     ((ggml_tensor*)src1->extra)->nb,
+            //     ((ggml_tensor*)dst->extra)->ne,
             //     ((ggml_tensor*)dst->extra)->nb);
             break;
         }
@@ -2882,7 +2834,8 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
             //     24, ctx.stream(), src0->data, src1->data, dst->data,
             //     ((ggml_tensor*)src0->extra)->ne,
             //     ((ggml_tensor*)src1->extra)->ne,
-            //     ((ggml_tensor*)src1->extra)->nb, ((ggml_tensor*)dst->extra)->ne,
+            //     ((ggml_tensor*)src1->extra)->nb,
+            //     ((ggml_tensor*)dst->extra)->ne,
             //     ((ggml_tensor*)dst->extra)->nb);
             break;
         }
