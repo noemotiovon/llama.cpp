@@ -30,6 +30,7 @@
 #include <aclnnop/aclnn_copy.h>
 #include <aclnnop/aclnn_cos.h>
 #include <aclnnop/aclnn_div.h>
+#include <aclnnop/aclnn_embedding.h>
 #include <aclnnop/aclnn_exp.h>
 #include <aclnnop/aclnn_fill_scalar.h>
 #include <aclnnop/aclnn_group_norm.h>
@@ -58,7 +59,6 @@
 #include <vector>
 
 #include "ggml-impl.h"
-#include "kernels/ascendc_kernels.h"
 
 #define GGML_COMMON_DECL_C
 
@@ -97,6 +97,23 @@ static void aclnn_repeat(ggml_backend_cann_context& ctx, aclTensor* acl_src,
     ACL_CHECK(
         aclnnRepeat(workspaceAddr, workspaceSize, executor, ctx.stream()));
     ACL_CHECK(aclDestroyIntArray(repeats));
+}
+
+void ggml_cann_cast(ggml_backend_cann_context& ctx, aclTensor* acl_src,
+                    aclTensor* acl_dst, ggml_tensor* dst) {
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor;
+    void* workspaceAddr = nullptr;
+    ACL_CHECK(aclnnCastGetWorkspaceSize(acl_src,
+                                        ggml_cann_type_mapping(dst->type),
+                                        acl_dst, &workspaceSize, &executor));
+
+    if (workspaceSize > 0) {
+        ggml_cann_pool_alloc workspace_allocator(ctx.pool(), workspaceSize);
+        workspaceAddr = workspace_allocator.get();
+    }
+
+    ACL_CHECK(aclnnCast(workspaceAddr, workspaceSize, executor, ctx.stream()));
 }
 
 void ggml_cann_repeat(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
@@ -889,173 +906,84 @@ static void cann_copy(ggml_backend_cann_context& ctx, aclTensor* acl_src,
 }
 
 void ggml_cann_dup(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
-    ggml_tensor* src = dst->src[0];
+    ggml_tensor* src0 = dst->src[0];
 
-    aclTensor* acl_src = ggml_cann_create_tensor(src);
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
+        GGML_ABORT("Only support src type in [F32, F16]");
+    }
+
+    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) {
+        GGML_ABORT("Only support dst type in [F32, F16]");
+    }
+
+    aclTensor* acl_src = ggml_cann_create_tensor(src0);
     aclTensor* acl_dst = ggml_cann_create_tensor(dst);
-
-    ggml_cann_pool_alloc src_extra_allocator(ctx.pool(), sizeof(ggml_tensor));
-    ggml_cann_pool_alloc dst_extra_allocator(ctx.pool(), sizeof(ggml_tensor));
-    src->extra = src_extra_allocator.get();
-    dst->extra = dst_extra_allocator.get();
-    ACL_CHECK(aclrtMemcpyAsync(src->extra, sizeof(ggml_tensor), src,
-                               sizeof(ggml_tensor), ACL_MEMCPY_HOST_TO_DEVICE,
-                               ctx.stream()));
-    ACL_CHECK(aclrtMemcpyAsync(dst->extra, sizeof(ggml_tensor), dst,
-                               sizeof(ggml_tensor), ACL_MEMCPY_HOST_TO_DEVICE,
-                               ctx.stream()));
-
-    if ((dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32) &&
-        ggml_are_same_shape(src, dst)) {
-        cann_copy(ctx, acl_src, acl_dst);
-        ACL_CHECK(aclDestroyTensor(acl_src));
-        ACL_CHECK(aclDestroyTensor(acl_dst));
-        return;
-    }
-    // TODO: simplify
-    if (src->type == GGML_TYPE_F16) {
-        if (dst->type == GGML_TYPE_Q8_0) {
-            aclrtlaunch_ascendc_quantize_f16_q8_0(
-                24, ctx.stream(), src->data, dst->data,
-                ((ggml_tensor*)src->extra)->ne, ((ggml_tensor*)src->extra)->nb,
-                ((ggml_tensor*)dst->extra)->ne);
-            return;
-        }
-        if (dst->type == GGML_TYPE_Q4_0) {
-            aclrtlaunch_ascendc_quantize_f16_to_q4_0(
-                24, ctx.stream(), src->data, dst->data,
-                ((ggml_tensor*)src->extra)->ne, ((ggml_tensor*)src->extra)->nb,
-                ((ggml_tensor*)dst->extra)->ne);
-            return;
-        }
-        if (dst->type == GGML_TYPE_F16) {
-            if (ggml_are_same_shape(src, dst)) {
-                cann_copy(ctx, acl_src, acl_dst);
-                ACL_CHECK(aclDestroyTensor(acl_src));
-                ACL_CHECK(aclDestroyTensor(acl_dst));
-                return;
-            }
-            if (ggml_is_contiguous(dst)) {
-                const size_t src_type_size = ggml_type_size(src->type);
-                if (src->nb[0] == src_type_size) {
-                    // src0 is contigous on first dimension, copy by rows
-                    int64_t rows_num = ggml_nrows(src);
-
-                    aclrtlaunch_ascendc_dup_by_rows_fp16(
-                        rows_num, ctx.stream(), src->data, dst->data,
-                        ((ggml_tensor*)src->extra)->ne,
-                        ((ggml_tensor*)src->extra)->nb,
-                        ((ggml_tensor*)dst->extra)->ne,
-                        ((ggml_tensor*)dst->extra)->nb);
-                    return;
-                }
-                GGML_ABORT("fatal error");
-            }
-            GGML_ABORT("fatal error");
-        }
-        if (dst->type == GGML_TYPE_F32) {
-            if (ggml_are_same_shape(src, dst)) {
-                cann_copy(ctx, acl_src, acl_dst);
-                ACL_CHECK(aclDestroyTensor(acl_src));
-                ACL_CHECK(aclDestroyTensor(acl_dst));
-                return;
-            }
-            if (ggml_is_contiguous(dst)) {
-                const size_t src_type_size = ggml_type_size(src->type);
-                if (src->nb[0] == src_type_size) {
-                    // src0 is contigous on first dimension, copy by rows
-                    int64_t rows_num = ggml_nrows(src);
-                    aclrtlaunch_ascendc_dup_by_rows_fp16_to_fp32(
-                        rows_num, ctx.stream(), src->data, dst->data,
-                        ((ggml_tensor*)src->extra)->ne,
-                        ((ggml_tensor*)src->extra)->nb,
-                        ((ggml_tensor*)dst->extra)->ne,
-                        ((ggml_tensor*)dst->extra)->nb);
-                    return;
-                }
-                GGML_ABORT("fatal error");
-            }
-            GGML_ABORT("fatal error");
-        }
-        // TODO
-        GGML_ABORT("fatal error");
-    } else if (src->type == GGML_TYPE_F32) {
-        // TODO: if (src0->type == dst->type && ne00 == ne0 && nb00 == type_size
-        //          && nb0 == type_size)
-        if (dst->type == GGML_TYPE_Q8_0) {
-            aclrtlaunch_ascendc_quantize_f32_q8_0(
-                24, ctx.stream(), src->data, dst->data,
-                ((ggml_tensor*)src->extra)->ne, ((ggml_tensor*)src->extra)->nb,
-                ((ggml_tensor*)dst->extra)->ne);
-            return;
-        }
-        if (dst->type == GGML_TYPE_Q4_0) {
-            aclrtlaunch_ascendc_quantize_f32_to_q4_0(
-                24, ctx.stream(), src->data, dst->data,
-                ((ggml_tensor*)src->extra)->ne, ((ggml_tensor*)src->extra)->nb,
-                ((ggml_tensor*)dst->extra)->ne);
-            return;
-        }
-        if (dst->type == GGML_TYPE_F32) {
-            if (ggml_are_same_shape(src, dst)) {
-                cann_copy(ctx, acl_src, acl_dst);
-                ACL_CHECK(aclDestroyTensor(acl_src));
-                ACL_CHECK(aclDestroyTensor(acl_dst));
-                return;
-            }
-            if (ggml_is_contiguous(dst)) {
-                const size_t src_type_size = ggml_type_size(src->type);
-                if (src->nb[0] == src_type_size) {
-                    // src0 is contigous on first dimension, copy by rows
-                    int64_t rows_num = ggml_nrows(src);
-                    aclrtlaunch_ascendc_dup_by_rows_fp32(
-                        rows_num, ctx.stream(), src->data, dst->data,
-                        ((ggml_tensor*)src->extra)->ne,
-                        ((ggml_tensor*)src->extra)->nb,
-                        ((ggml_tensor*)dst->extra)->ne,
-                        ((ggml_tensor*)dst->extra)->nb);
-                    return;
-                }
-                GGML_ABORT("fatal error");
-            } else {
-                // TODO: dst not contiguous
-                GGML_ABORT("fatal error");
-            }
-        }
-        if (dst->type == GGML_TYPE_F16) {
-            if (ggml_are_same_shape(src, dst)) {
-                cann_copy(ctx, acl_src, acl_dst);
-                ACL_CHECK(aclDestroyTensor(acl_src));
-                ACL_CHECK(aclDestroyTensor(acl_dst));
-                return;
-            }
-            if (ggml_is_contiguous(dst)) {
-                const size_t src_type_size = ggml_type_size(src->type);
-                if (src->nb[0] == src_type_size) {
-                    // src0 is contigous on first dimension, copy by rows
-                    int64_t rows_num = ggml_nrows(src);
-                    aclrtlaunch_ascendc_dup_by_rows_fp32_to_fp16(
-                        rows_num, ctx.stream(), src->data, dst->data,
-                        ((ggml_tensor*)src->extra)->ne,
-                        ((ggml_tensor*)src->extra)->nb,
-                        ((ggml_tensor*)dst->extra)->ne,
-                        ((ggml_tensor*)dst->extra)->nb);
-                    return;
-                }
-                GGML_ABORT("fatal error");
-            }
-        }
-        // TODO
-        GGML_ABORT("fatal error");
-    } else {
-        if (ggml_are_same_shape(src, dst)) {
+    if (ggml_are_same_shape(src0, dst)) {
+        if (dst->type == src0->type) {
             cann_copy(ctx, acl_src, acl_dst);
-            ACL_CHECK(aclDestroyTensor(acl_src));
-            ACL_CHECK(aclDestroyTensor(acl_dst));
-            return;
+        } else {
+            ggml_cann_cast(ctx, acl_src, acl_dst, dst);
         }
-        GGML_ABORT("fatal error");
+    } else {
+        if (ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
+            if (dst->type == src0->type) {
+                size_t cpy_size = ggml_nbytes(dst);
+                ACL_CHECK(aclrtMemcpyAsync(
+                    dst->data, cpy_size, src0->data, cpy_size,
+                    ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+                return;
+            } else {
+                ggml_cann_pool_alloc src_buffer_allocator(
+                    ctx.pool(),
+                    ggml_nelements(dst) * ggml_type_size(dst->type));
+                void* src_trans_buffer = src_buffer_allocator.get();
+                size_t src_trans_nb[GGML_MAX_DIMS];
+                src_trans_nb[0] = ggml_type_size(dst->type);
+                for (int i = 1; i < GGML_MAX_DIMS; i++) {
+                    src_trans_nb[i] = src_trans_nb[i - 1] * src0->ne[i - 1];
+                }
+                aclTensor* src_trans_tensor = ggml_cann_create_tensor(
+                    src_trans_buffer, ggml_cann_type_mapping(dst->type),
+                    ggml_type_size(dst->type), src0->ne, src_trans_nb,
+                    GGML_MAX_DIMS);
+
+                ggml_cann_cast(ctx, acl_src, src_trans_tensor, dst);
+                size_t cpy_size = ggml_nbytes(dst);
+                ACL_CHECK(aclrtMemcpyAsync(
+                    dst->data, cpy_size, src_trans_buffer, cpy_size,
+                    ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+                ACL_CHECK(aclDestroyTensor(src_trans_tensor));
+                return;
+            }
+        } else if (ggml_is_contiguous(dst)) {
+            ggml_cann_pool_alloc src_buffer_allocator(
+                ctx.pool(), ggml_nelements(dst) * ggml_type_size(dst->type));
+            void* src_trans_buffer = src_buffer_allocator.get();
+            size_t src_trans_nb[GGML_MAX_DIMS];
+            src_trans_nb[0] = ggml_type_size(dst->type);
+            for (int i = 1; i < GGML_MAX_DIMS; i++) {
+                src_trans_nb[i] = src_trans_nb[i - 1] * src0->ne[i - 1];
+            }
+            aclTensor* src_trans_tensor = ggml_cann_create_tensor(
+                src_trans_buffer, ggml_cann_type_mapping(dst->type),
+                ggml_type_size(dst->type), src0->ne, src_trans_nb,
+                GGML_MAX_DIMS);
+
+            ggml_cann_cast(ctx, acl_src, src_trans_tensor, dst);
+
+            size_t cpy_size = ggml_nbytes(dst);
+            ACL_CHECK(aclrtMemcpyAsync(dst->data, cpy_size, src_trans_buffer,
+                                       cpy_size, ACL_MEMCPY_DEVICE_TO_DEVICE,
+                                       ctx.stream()));
+            ACL_CHECK(aclDestroyTensor(src_trans_tensor));
+            return;
+        } else {
+            GGML_ABORT("Unsupport dst is not tontiguous.");
+        }
     }
+
+    ACL_CHECK(aclDestroyTensor(acl_src));
+    ACL_CHECK(aclDestroyTensor(acl_dst));
 }
 
 #ifdef __cplusplus
@@ -2378,85 +2306,90 @@ void ggml_cann_softmax(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     ACL_CHECK(aclDestroyTensor(tmp_mask_tensor));
 }
 
-void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
-    ggml_tensor* src0 = dst->src[0];
-    ggml_tensor* src1 = dst->src[1];
+void ggml_cann_embedding_4d(ggml_backend_cann_context& ctx, void* src_buffer,
+                            int64_t* src_ne, size_t* src_nb, ggml_tensor* index,
+                            ggml_tensor* dst) {
+    for (int64_t i = 0; i < src_ne[3]; i++) {
+        for (int64_t j = 0; j < src_ne[2]; j++) {
+            // src
+            int64_t acl_src_ne[2] = {src_ne[0], src_ne[1]};
+            size_t acl_src_nb[2] = {src_nb[0], src_nb[1]};
+            aclTensor* acl_src_tensor = ggml_cann_create_tensor(
+                (char*)src_buffer + i * src_nb[3] + j * src_nb[2],
+                ggml_cann_type_mapping(dst->type), ggml_element_size(dst),
+                acl_src_ne, acl_src_nb, 2);
 
-    ggml_cann_pool_alloc src0_extra_allocator(ctx.pool(), sizeof(ggml_tensor));
-    ggml_cann_pool_alloc src1_extra_allocator(ctx.pool(), sizeof(ggml_tensor));
-    ggml_cann_pool_alloc dst_extra_allocator(ctx.pool(), sizeof(ggml_tensor));
-    src0->extra = src0_extra_allocator.get();
-    src1->extra = src1_extra_allocator.get();
-    dst->extra = dst_extra_allocator.get();
-    ACL_CHECK(aclrtMemcpyAsync(src0->extra, sizeof(ggml_tensor), src0,
-                               sizeof(ggml_tensor), ACL_MEMCPY_HOST_TO_DEVICE,
-                               ctx.stream()));
-    ACL_CHECK(aclrtMemcpyAsync(src1->extra, sizeof(ggml_tensor), src1,
-                               sizeof(ggml_tensor), ACL_MEMCPY_HOST_TO_DEVICE,
-                               ctx.stream()));
-    ACL_CHECK(aclrtMemcpyAsync(dst->extra, sizeof(ggml_tensor), dst,
-                               sizeof(ggml_tensor), ACL_MEMCPY_HOST_TO_DEVICE,
-                               ctx.stream()));
+            // index
+            int64_t acl_index_ne[1] = {index->ne[0]};
+            size_t acl_index_nb[1] = {index->nb[0]};
+            aclTensor* acl_index = ggml_cann_create_tensor(
+                (char*)index->data + i * index->nb[2] + j * index->nb[1],
+                ggml_cann_type_mapping(index->type), ggml_element_size(index),
+                acl_index_ne, acl_index_nb, 1);
+
+            // out
+            int64_t acl_out_ne[2] = {dst->ne[0], dst->ne[1]};
+            size_t acl_out_nb[2] = {dst->nb[0], dst->nb[1]};
+            aclTensor* acl_out = ggml_cann_create_tensor(
+                (char*)dst->data + i * dst->nb[3] + j * dst->nb[2],
+                ggml_cann_type_mapping(dst->type), ggml_element_size(dst),
+                acl_out_ne, acl_out_nb, 2);
+
+            uint64_t workspaceSize = 0;
+            aclOpExecutor* executor;
+            void* workspaceAddr = nullptr;
+
+            ACL_CHECK(aclnnEmbeddingGetWorkspaceSize(
+                acl_src_tensor, acl_index, acl_out, &workspaceSize, &executor));
+
+            if (workspaceSize > 0) {
+                ggml_cann_pool_alloc workspace_allocator(ctx.pool(),
+                                                         workspaceSize);
+                workspaceAddr = workspace_allocator.get();
+            }
+
+            ACL_CHECK(aclnnEmbedding(workspaceAddr, workspaceSize, executor,
+                                     ctx.stream()));
+
+            ACL_CHECK(aclDestroyTensor(acl_src_tensor));
+            ACL_CHECK(aclDestroyTensor(acl_index));
+            ACL_CHECK(aclDestroyTensor(acl_out));
+        }
+    }
+}
+
+void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
+    ggml_tensor* src0 = dst->src[0];  // src
+    ggml_tensor* src1 = dst->src[1];  // index
 
     switch (src0->type) {
         case GGML_TYPE_F32: {
-#ifdef ASCEND_310P
-            // Special operation for get_row_f32 kernel of 310P: clear the
-            // content of dest data buffer when row is not aligned to 32 bytes
-            if ((src0->ne[0] % 8) != 0) {
-                size_t dst_len = src1->ne[0] * src1->ne[1] * src1->ne[2] *
-                                 src0->ne[0] * ggml_type_size(GGML_TYPE_F32);
-                ACL_CHECK(aclrtMemset((char*)dst->data, dst_len, 0, dst_len));
-            }
-#endif
-            aclrtlaunch_ascendc_get_row_f32(
-                24, ctx.stream(), src0->data, src1->data, dst->data,
-                ((ggml_tensor*)src0->extra)->ne,
-                ((ggml_tensor*)src0->extra)->nb,
-                ((ggml_tensor*)src1->extra)->ne,
-                ((ggml_tensor*)src1->extra)->nb, ((ggml_tensor*)dst->extra)->ne,
-                ((ggml_tensor*)dst->extra)->nb);
+            ggml_cann_embedding_4d(ctx, src0->data, src0->ne, src0->nb, src1,
+                                   dst);
             break;
         }
         case GGML_TYPE_F16: {
-#ifdef ASCEND_310P
-            // Special operation for get_row_f16 kernel of 310P: clear the
-            // content of dest data buffer when row is not aligned to 32 bytes
-            if ((src0->ne[0] % 16) != 0) {
-                size_t dst_len =
-                    src1->ne[0] * src1->ne[1] * src1->ne[2] * src0->ne[0] *
-                    ggml_type_size(
-                        GGML_TYPE_F32);  // out is also f32, even input is f16
-                ACL_CHECK(aclrtMemset((char*)dst->data, dst_len, 0, dst_len));
+            aclTensor* acl_src0 = ggml_cann_create_tensor(src0);
+            ggml_cann_pool_alloc src_buffer_allocator(
+                ctx.pool(), ggml_nelements(src0) * sizeof(float_t));
+            void* src_trans_buffer = src_buffer_allocator.get();
+            size_t src_trans_nb[GGML_MAX_DIMS];
+            src_trans_nb[0] = sizeof(float_t);
+            for (int i = 1; i < GGML_MAX_DIMS; i++) {
+                src_trans_nb[i] = src_trans_nb[i - 1] * src0->ne[i - 1];
             }
-#endif
-            aclrtlaunch_ascendc_get_row_f16(
-                24, ctx.stream(), src0->data, src1->data, dst->data,
-                ((ggml_tensor*)src0->extra)->ne,
-                ((ggml_tensor*)src0->extra)->nb,
-                ((ggml_tensor*)src1->extra)->ne,
-                ((ggml_tensor*)src1->extra)->nb, ((ggml_tensor*)dst->extra)->ne,
-                ((ggml_tensor*)dst->extra)->nb);
+            aclTensor* src_trans_tensor = ggml_cann_create_tensor(
+                src_trans_buffer, ACL_FLOAT, ggml_type_size(dst->type),
+                src0->ne, src_trans_nb, GGML_MAX_DIMS);
+            ggml_cann_cast(ctx, acl_src0, src_trans_tensor, dst);
+            ggml_cann_embedding_4d(ctx, src_trans_buffer, src0->ne,
+                                   src_trans_nb, src1, dst);
+            ACL_CHECK(aclDestroyTensor(acl_src0));
+            ACL_CHECK(aclDestroyTensor(src_trans_tensor));
             break;
         }
-        case GGML_TYPE_Q4_0:
-            aclrtlaunch_ascendc_get_row_q4_0(
-                24, ctx.stream(), src0->data, src1->data, dst->data,
-                ((ggml_tensor*)src0->extra)->ne,
-                ((ggml_tensor*)src1->extra)->ne,
-                ((ggml_tensor*)src1->extra)->nb, ((ggml_tensor*)dst->extra)->ne,
-                ((ggml_tensor*)dst->extra)->nb);
-            break;
-        case GGML_TYPE_Q8_0:
-            aclrtlaunch_ascendc_get_row_q8_0(
-                24, ctx.stream(), src0->data, src1->data, dst->data,
-                ((ggml_tensor*)src0->extra)->ne,
-                ((ggml_tensor*)src1->extra)->ne,
-                ((ggml_tensor*)src1->extra)->nb, ((ggml_tensor*)dst->extra)->ne,
-                ((ggml_tensor*)dst->extra)->nb);
-            break;
         default:
-            GGML_ABORT("fatal error");
+            GGML_ABORT("Unsupported tensor type for GGML_OP_GET_ROWS");
             break;
     }
 }
@@ -2797,8 +2730,8 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
 
             ACL_CHECK(aclnnWeightQuantBatchMatmulV2GetWorkspaceSize(
                 acl_input_tensor, acl_weight_tensor, acl_scale_tensor, nullptr,
-                nullptr, nullptr, nullptr, antiquantGroupSize, acl_output_tensor,
-                &workspaceSize, &executor));
+                nullptr, nullptr, nullptr, antiquantGroupSize,
+                acl_output_tensor, &workspaceSize, &executor));
             if (workspaceAddr == nullptr) {
                 workspaceAddr = workspace_allocator.alloc(workspaceSize);
             }
