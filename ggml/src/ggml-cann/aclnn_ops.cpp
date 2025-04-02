@@ -908,14 +908,6 @@ static void cann_copy(ggml_backend_cann_context& ctx, aclTensor* acl_src,
 void ggml_cann_dup(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     ggml_tensor* src0 = dst->src[0];
 
-    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) {
-        GGML_ABORT("Only support src type in [F32, F16]");
-    }
-
-    if (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) {
-        GGML_ABORT("Only support dst type in [F32, F16]");
-    }
-
     aclTensor* acl_src = ggml_cann_create_tensor(src0);
     aclTensor* acl_dst = ggml_cann_create_tensor(dst);
     if (ggml_are_same_shape(src0, dst)) {
@@ -2386,6 +2378,68 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                                    src_trans_nb, src1, dst);
             ACL_CHECK(aclDestroyTensor(acl_src0));
             ACL_CHECK(aclDestroyTensor(src_trans_tensor));
+            break;
+        }
+        case GGML_TYPE_Q8_0: {
+            // add 1 dim for bcast mul.
+            size_t weight_nb[GGML_MAX_DIMS + 1], scale_nb[GGML_MAX_DIMS + 1],
+                dequant_nb[GGML_MAX_DIMS + 1];
+            int64_t weight_ne[GGML_MAX_DIMS + 1], scale_ne[GGML_MAX_DIMS + 1],
+                *dequant_ne;
+            int64_t scale_offset = 0;
+
+            // [3,4,5,64] -> [3,4,5,2,32]
+            weight_ne[0] = QK8_0;
+            weight_ne[1] = src0->ne[0] / QK8_0;
+            weight_nb[0] = sizeof(int8_t);
+            weight_nb[1] = weight_nb[0] * weight_ne[0];
+            for (int i = 2; i < GGML_MAX_DIMS + 1; i++) {
+                weight_ne[i] = src0->ne[i - 1];
+                weight_nb[i] = weight_nb[i - 1] * weight_ne[i - 1];
+            }
+
+            // [3,4,5,64] -> [3,4,5,2,1]
+            scale_ne[0] = 1;
+            scale_ne[1] = src0->ne[0] / QK8_0;
+            scale_nb[0] = sizeof(uint16_t);
+            scale_nb[1] = scale_nb[0] * scale_ne[0];
+            for (int i = 2; i < GGML_MAX_DIMS + 1; i++) {
+                scale_ne[i] = src0->ne[i - 1];
+                scale_nb[i] = scale_nb[i - 1] * scale_ne[i - 1];
+            }
+
+            // [3,4,5,64] -> [3,4,5,2,32]
+            dequant_ne = weight_ne;
+            dequant_nb[0] = sizeof(float_t);
+            for (int i = 1; i < GGML_MAX_DIMS + 1; i++) {
+                dequant_nb[i] = dequant_nb[i - 1] * dequant_ne[i - 1];
+            }
+
+            scale_offset = ggml_nelements(src0) * sizeof(int8_t);
+            ggml_cann_pool_alloc dequant_buffer_allocator(
+                ctx.pool(), ggml_nelements(src0) * sizeof(float_t));
+
+            aclTensor* acl_weight_tensor = ggml_cann_create_tensor(
+                src0->data, ACL_INT8, sizeof(int8_t), weight_ne, weight_nb,
+                GGML_MAX_DIMS + 1);
+            aclTensor* acl_scale_tensor = ggml_cann_create_tensor(
+                src0->data, ACL_FLOAT16, sizeof(float16_t), scale_ne, scale_nb,
+                GGML_MAX_DIMS + 1, ACL_FORMAT_ND, scale_offset);
+            aclTensor* dequant_tensor = ggml_cann_create_tensor(
+                dequant_buffer_allocator.get(), ACL_FLOAT, sizeof(float_t),
+                dequant_ne, dequant_nb, GGML_MAX_DIMS + 1);
+
+            aclnn_mul(ctx, acl_weight_tensor, acl_scale_tensor, dequant_tensor);
+            dequant_nb[0] = sizeof(float_t);
+            dequant_ne = src0->ne;
+            for (int i = 1; i < GGML_MAX_DIMS; i++) {
+                dequant_nb[i] = dequant_nb[i - 1] * src0->ne[i - 1];
+            }
+
+            ggml_cann_embedding_4d(ctx, dequant_buffer_allocator.get(),
+                                   dequant_ne, dequant_nb, src1, dst);
+
+            ACL_CHECK(aclDestroyTensor(dequant_tensor));
             break;
         }
         default:
