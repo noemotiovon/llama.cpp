@@ -2313,10 +2313,10 @@ void ggml_cann_softmax(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
 /**
  * @brief Performs embedding operation on a 4D tensor using the CANN backend.
  *
- * This function extracts slices from the source tensor (`src_buffer`),  
- * index tensor (`index`), and destination tensor (`dst`), and performs an  
- * embedding operation on them. The embedding operation is applied by iterating  
- * over the last two dimensions of the source tensor, creating the necessary 
+ * This function extracts slices from the source tensor (`src_buffer`),
+ * index tensor (`index`), and destination tensor (`dst`), and performs an
+ * embedding operation on them. The embedding operation is applied by iterating
+ * over the last two dimensions of the source tensor, creating the necessary
  * tensors for the source, index, and output, and executing the embedding operation.
  * 
  * @param ctx The context for CANN backend operations.
