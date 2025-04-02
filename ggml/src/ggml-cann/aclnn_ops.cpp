@@ -99,7 +99,19 @@ static void aclnn_repeat(ggml_backend_cann_context& ctx, aclTensor* acl_src,
     ACL_CHECK(aclDestroyIntArray(repeats));
 }
 
-void ggml_cann_cast(ggml_backend_cann_context& ctx, aclTensor* acl_src,
+/**
+ * @brief Casts the elements of a tensor to a specified data type using the CANN backend.
+ *
+ * @details This function performs a type conversion on the elements of the input tensor `acl_src`
+ *          and stores the results in the destination tensor `acl_dst`. The conversion type is
+ *          determined based on the `dst` tensor's data type.
+ *
+ * @param ctx The context for the CANN backend operations.
+ * @param acl_src The source tensor whose elements will be cast.
+ * @param acl_dst The destination tensor that will store the casted elements.
+ * @param dst The ggml tensor specifying the target data type.
+ */
+static void aclnn_cast(ggml_backend_cann_context& ctx, aclTensor* acl_src,
                     aclTensor* acl_dst, ggml_tensor* dst) {
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor;
@@ -914,7 +926,7 @@ void ggml_cann_dup(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
         if (dst->type == src0->type) {
             cann_copy(ctx, acl_src, acl_dst);
         } else {
-            ggml_cann_cast(ctx, acl_src, acl_dst, dst);
+            aclnn_cast(ctx, acl_src, acl_dst, dst);
         }
     } else {
         if (ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
@@ -939,7 +951,7 @@ void ggml_cann_dup(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                     ggml_type_size(dst->type), src0->ne, src_trans_nb,
                     GGML_MAX_DIMS);
 
-                ggml_cann_cast(ctx, acl_src, src_trans_tensor, dst);
+                aclnn_cast(ctx, acl_src, src_trans_tensor, dst);
                 size_t cpy_size = ggml_nbytes(dst);
                 ACL_CHECK(aclrtMemcpyAsync(
                     dst->data, cpy_size, src_trans_buffer, cpy_size,
@@ -961,7 +973,7 @@ void ggml_cann_dup(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                 ggml_type_size(dst->type), src0->ne, src_trans_nb,
                 GGML_MAX_DIMS);
 
-            ggml_cann_cast(ctx, acl_src, src_trans_tensor, dst);
+            aclnn_cast(ctx, acl_src, src_trans_tensor, dst);
 
             size_t cpy_size = ggml_nbytes(dst);
             ACL_CHECK(aclrtMemcpyAsync(dst->data, cpy_size, src_trans_buffer,
@@ -2298,7 +2310,22 @@ void ggml_cann_softmax(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     ACL_CHECK(aclDestroyTensor(tmp_mask_tensor));
 }
 
-void ggml_cann_embedding_4d(ggml_backend_cann_context& ctx, void* src_buffer,
+/**
+ * @brief Performs embedding operation on a 4D tensor using the CANN backend.
+ *
+ * @details This function extracts slices from the source tensor (`src_buffer`), index tensor (`index`), 
+ *          and destination tensor (`dst`), and performs an embedding operation on them. The embedding 
+ *          operation is applied by iterating over the last two dimensions of the source tensor, creating 
+ *          the necessary tensors for the source, index, and output, and executing the embedding operation.
+ * 
+ * @param ctx The context for CANN backend operations.
+ * @param src_buffer The source buffer holding the data for the source tensor.
+ * @param src_ne The dimensions of the source tensor.
+ * @param src_nb The strides (byte offsets) of the source tensor.
+ * @param index The index tensor used in the embedding operation.
+ * @param dst The destination tensor where the result will be stored.
+ */
+static void aclnn_embedding_4d(ggml_backend_cann_context& ctx, void* src_buffer,
                             int64_t* src_ne, size_t* src_nb, ggml_tensor* index,
                             ggml_tensor* dst) {
     for (int64_t i = 0; i < src_ne[3]; i++) {
@@ -2356,7 +2383,7 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
 
     switch (src0->type) {
         case GGML_TYPE_F32: {
-            ggml_cann_embedding_4d(ctx, src0->data, src0->ne, src0->nb, src1,
+            aclnn_embedding_4d(ctx, src0->data, src0->ne, src0->nb, src1,
                                    dst);
             break;
         }
@@ -2373,8 +2400,8 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
             aclTensor* src_trans_tensor = ggml_cann_create_tensor(
                 src_trans_buffer, ACL_FLOAT, ggml_type_size(dst->type),
                 src0->ne, src_trans_nb, GGML_MAX_DIMS);
-            ggml_cann_cast(ctx, acl_src0, src_trans_tensor, dst);
-            ggml_cann_embedding_4d(ctx, src_trans_buffer, src0->ne,
+            aclnn_cast(ctx, acl_src0, src_trans_tensor, dst);
+            aclnn_embedding_4d(ctx, src_trans_buffer, src0->ne,
                                    src_trans_nb, src1, dst);
             ACL_CHECK(aclDestroyTensor(acl_src0));
             ACL_CHECK(aclDestroyTensor(src_trans_tensor));
@@ -2436,7 +2463,7 @@ void ggml_cann_get_rows(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                 dequant_nb[i] = dequant_nb[i - 1] * src0->ne[i - 1];
             }
 
-            ggml_cann_embedding_4d(ctx, dequant_buffer_allocator.get(),
+            aclnn_embedding_4d(ctx, dequant_buffer_allocator.get(),
                                    dequant_ne, dequant_nb, src1, dst);
 
             ACL_CHECK(aclDestroyTensor(dequant_tensor));
