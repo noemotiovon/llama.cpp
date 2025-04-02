@@ -2318,7 +2318,7 @@ void ggml_cann_softmax(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
  * embedding operation on them. The embedding operation is applied by iterating
  * over the last two dimensions of the source tensor, creating the necessary
  * tensors for the source, index, and output, and executing the embedding operation.
- * 
+ *
  * @param ctx The context for CANN backend operations.
  * @param src_buffer The source buffer holding the data for the source tensor.
  * @param src_ne The dimensions of the source tensor.
