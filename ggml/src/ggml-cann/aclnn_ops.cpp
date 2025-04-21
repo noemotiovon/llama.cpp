@@ -2593,16 +2593,6 @@ void ggml_cann_step(ggml_backend_cann_context& ctx, ggml_tensor* dst){
     ggml_cann_release_resources(ctx, acl_src, acl_dst, alpha);
 }
 
-
-//张量	维度 (ne0, ne1, ne2, ne3)	含义说明
-//src0	[D, M, A, 1]	expert 权重矩阵集合，每个 expert 是 [D×M]
-//src1	[D, B, N, 1]	输入 token 的表示，每个 token 是 [D] 向量
-//ids	[K, N]	        token 分配给哪些 expert（索引）
-//out   [M, K, N, 1]
-//A = ne03: 总共有 A 个 expert，表示 expert 的数量（即：一个 expert 对应一个 [D, M] 的子矩阵）
-//B = ne11: 一组 token（或样本）的数量
-//N = ne12: batch 中样本的数量
-//K = ne0: 每个 token 被分配的 expert 数量（比如 top-1 或 top-2）
 void ggml_cann_mul_mat_id(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     //dst   [M, K, N, 1]
     ggml_tensor * src0 = dst->src[0];  //src0	[D, M, A, 1]
@@ -2655,8 +2645,7 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
 
                 GGML_ASSERT(i02 >= 0 && i02 < n_as);
 
-                // int64_t i11 = id % ne11;
-                // 如果 B=1（broadcast），始终取 0；否则取 id
+                // If B = 1 (broadcast), always use 0; otherwise, use id.
                 int64_t i11 = (ne11 == 1 ? 0 : id);
                 int64_t i12 = iid1;
 
