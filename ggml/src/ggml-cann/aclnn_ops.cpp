@@ -2622,13 +2622,13 @@ void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     char * src1_original = (char *) src1->data;
     char * dst_original  = (char *)  dst->data;
     size_t ori_src0_nb[4] = {nb00, nb01, nb02, nb03};
-    
+
     // src0 is F16, src1 is F32, dst is F32
     ggml_cann_pool_alloc src0_cast_allocator;
     if (src0->type == GGML_TYPE_F16) {
         src0_cast_allocator.alloc(ctx.pool(), sizeof(float) * ggml_nelements(src0));
         void* src0_cast_buf = src0_cast_allocator.get();
-        
+
         size_t cast_nb[GGML_MAX_DIMS];
         cast_nb[0] = sizeof(float_t);
         for (int i = 1; i < GGML_MAX_DIMS; i++) {
@@ -2736,13 +2736,12 @@ void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                         char* dst_ptr = (char*)src1_cont_buf + total_num_src1_rows * nb11;
                         ggml_cann_async_memcpy(ctx, dst_ptr, src_ptr, nb11,
                             ACL_MEMCPY_DEVICE_TO_DEVICE);
-                        
+
                         num_src1_rows++;
                         total_num_src1_rows++;
                     }
                 }
             }
-        
             // expert_map index is expert index
             expert_mapping expert_map;
             expert_map.row_mappings = row_mappings;
@@ -2798,7 +2797,7 @@ void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                     ACL_MEMCPY_DEVICE_TO_DEVICE);
             }
 
-        }  
+        }
         ggml_cann_release_resources(ctx, src0_tensor_list, src1_tensor_list, dst_tensor_list);
     }
     return;
