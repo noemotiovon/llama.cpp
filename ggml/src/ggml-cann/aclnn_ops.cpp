@@ -2601,7 +2601,7 @@ void ggml_cann_step(ggml_backend_cann_context& ctx, ggml_tensor* dst){
 }
 
 /**
- * @brief Performs expert-specific matrix multiplication (MoE) with 
+ * @brief Performs expert-specific matrix multiplication (MoE) with
  * floating-point precision using the CANN backend.
  *
  * This function executes a matrix multiplication operation tailored for
@@ -2612,7 +2612,7 @@ void ggml_cann_step(ggml_backend_cann_context& ctx, ggml_tensor* dst){
  * as part of sparse expert selection.
  *
  * @param ctx The context for executing CANN backend operations.
- * @param dst The destination tensor where the MoE multiplication result 
+ * @param dst The destination tensor where the MoE multiplication result
  * will be stored.
  *
  * @note This function assumes floating-point data types and is designed for
