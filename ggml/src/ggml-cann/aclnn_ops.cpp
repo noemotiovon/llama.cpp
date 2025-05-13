@@ -65,6 +65,7 @@
 #include <aclnnop/aclnn_eq_tensor.h>
 #include <aclnnop/aclnn_gt_scalar.h>
 #include <aclnnop/aclnn_pow.h>
+#include <aclnnop/aclnn_grouped_matmul_v2.h>
 #include <float.h>
 
 #include <cmath>
@@ -81,6 +82,12 @@
 struct mmid_row_mapping {
     int32_t i1;
     int32_t i2;
+};
+
+struct expert_mapping {
+    std::vector<mmid_row_mapping> row_mappings;
+    int64_t num_src1_rows;
+    int64_t offset;
 };
 
 void bcast_shape(ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst, aclTensor ** acl_src0,
@@ -2593,7 +2600,7 @@ void ggml_cann_step(ggml_backend_cann_context& ctx, ggml_tensor* dst){
     ggml_cann_release_resources(ctx, acl_src, acl_dst, alpha);
 }
 
-void ggml_cann_mul_mat_id(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
+void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     //dst   [M, K, N, 1]
     ggml_tensor * src0 = dst->src[0];  //src0	[D, M, A, 1]
     ggml_tensor * src1 = dst->src[1];  //src1	[D, B, N, 1], B = K or B = 1
@@ -2601,6 +2608,7 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // copy index from npu to cpu
     int64_t n_as = ne02; // A
     int64_t n_ids = ids->ne[0]; // K
 
@@ -2613,36 +2621,49 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     char * src0_original = (char *) src0->data;
     char * src1_original = (char *) src1->data;
     char * dst_original  = (char *)  dst->data;
+    size_t ori_src0_nb[4] = {nb00, nb01, nb02, nb03};
+    
+    // src0 is F16, src1 is F32, dst is F32
+    ggml_cann_pool_alloc src0_cast_allocator;
+    if (src0->type == GGML_TYPE_F16) {
+        src0_cast_allocator.alloc(ctx.pool(), sizeof(float) * ggml_nelements(src0));
+        void* src0_cast_buf = src0_cast_allocator.get();
+        
+        size_t cast_nb[GGML_MAX_DIMS];
+        cast_nb[0] = sizeof(float_t);
+        for (int i = 1; i < GGML_MAX_DIMS; i++) {
+            cast_nb[i] = cast_nb[i - 1] * src0->ne[i - 1];
+        }
 
-    ggml_tensor src0_row = *src0;
-    ggml_tensor src1_row = *src1;
-    ggml_tensor dst_row  = *dst;
+        aclTensor* acl_src0_f16 = ggml_cann_create_tensor(src0);
+        aclTensor* acl_cast = ggml_cann_create_tensor(src0_cast_buf,
+            ACL_FLOAT, sizeof(float), src0->ne, cast_nb, 4);
+        GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_src0_f16, ACL_FLOAT, acl_cast);
+        ggml_cann_release_resources(ctx, acl_cast, acl_src0_f16);
 
-    // src0_row [D, M, 1, 1]
-    src0_row.ne[2] = 1;
-    src0_row.ne[3] = 1;
-    src0_row.nb[3] = nb02;
+        src0_original = (char *) src0_cast_buf;
+        memcpy(ori_src0_nb, cast_nb, sizeof(ori_src0_nb));
+    }
 
-    // src1_row [D, 1, 1, 1]
-    src1_row.ne[1] = 1;
-    src1_row.ne[2] = 1;
-    src1_row.ne[3] = 1;
-    src1_row.nb[2] = nb11;
-    src1_row.nb[3] = nb11;
-
-    // dst_row [D, 1, 1, 1]
-    dst_row.ne[1] = 1;
-    dst_row.ne[2] = 1;
-    dst_row.ne[3] = 1;
-    dst_row.nb[2] = nb1;
-    dst_row.nb[3] = nb1;
-
+    std::vector<aclTensor*> src0_tensor_vec;
+    std::vector<aclTensor*> src1_tensor_vec;
+    std::vector<aclTensor*> dst_tensor_vec;
     // ne12 == ids->ne[1] == N
     if (ne12 == 1) {
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
-                int32_t i02 = *(int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
+                // src0_row [M, D] -> weight && permute
+                int64_t src0_ne[2] = {ne01, ne00};
+                size_t src0_nb[2] = {ori_src0_nb[1], ori_src0_nb[0]};
+                // src1_row [D, 1] -> input
+                int64_t src1_ne[2] = {ne10, 1};
+                size_t src1_nb[2] = {nb10, nb11};
+                // dst_row [M, 1] -> out
+                int64_t dst_ne[2] = {ne0, 1};
+                size_t dst_nb[2] = {nb0, nb1};
 
+                // expert index
+                int32_t i02 = *(int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
                 GGML_ASSERT(i02 >= 0 && i02 < n_as);
 
                 // If B = 1 (broadcast), always use 0; otherwise, use id.
@@ -2652,30 +2673,51 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                 int64_t i1 = id;
                 int64_t i2 = i12;
 
-                src0_row.data = src0_original + i02*nb02;
-                src1_row.data = src1_original + i11*nb11 + i12*nb12;
-                dst_row.data  =  dst_original + i1*nb1   + i2*nb2;
-                dst_row.src[0] = &src0_row;
-                dst_row.src[1] = &src1_row;
-                ggml_cann_mul_mat(ctx, &dst_row);
+                void* src0_tmp_ptr = src0_original + i02*ori_src0_nb[2];
+                void* src1_tmp_ptr = src1_original + i11*nb11 + i12*nb12;
+                void* dst_tmp_ptr  = dst_original  + i1*nb1   + i2*nb2;
+
+                aclTensor* acl_src0 = ggml_cann_create_tensor(src0_tmp_ptr,
+                    ACL_FLOAT, sizeof(float),
+                    src0_ne, src0_nb, 2);
+                aclTensor* acl_src1 = ggml_cann_create_tensor(src1_tmp_ptr,
+                    ACL_FLOAT, sizeof(float),
+                    src1_ne, src1_nb, 2);
+                aclTensor* acl_dst = ggml_cann_create_tensor(dst_tmp_ptr,
+                    ACL_FLOAT, sizeof(float),
+                    dst_ne, dst_nb, 2);
+
+                src0_tensor_vec.push_back(acl_src0);
+                src1_tensor_vec.push_back(acl_src1);
+                dst_tensor_vec.push_back(acl_dst);
             }
         }
+        aclTensorList* src0_tensor_list = aclCreateTensorList(src0_tensor_vec.data(), src0_tensor_vec.size());
+        aclTensorList* src1_tensor_list = aclCreateTensorList(src1_tensor_vec.data(), src1_tensor_vec.size());
+        aclTensorList* dst_tensor_list = aclCreateTensorList(dst_tensor_vec.data(), dst_tensor_vec.size());
+
+        GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV2, src1_tensor_list, src0_tensor_list,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, -1, dst_tensor_list);
+
+        ggml_cann_release_resources(ctx, src0_tensor_list, src1_tensor_list, dst_tensor_list);
     } else {
         ggml_cann_pool_alloc src1_cont_allocator(
-            ctx.pool(),sizeof(float) * ggml_nelements(src1));
+            ctx.pool(),sizeof(float) * ggml_nelements(src1) / ne11 * ids->ne[0]);
         ggml_cann_pool_alloc dst_cont_allocator(
             ctx.pool(), sizeof(float) * ggml_nelements(dst));
 
         void* src1_cont_buf = src1_cont_allocator.get();
         void* dst_cont_buf  = dst_cont_allocator.get();
 
-        src1_row.data = src1_cont_buf;
-        dst_row.data  = dst_cont_buf;
-
+        std::vector<expert_mapping> expert_mappings;
+        int64_t total_num_src1_rows = 0;
         for (int64_t i02 = 0; i02 < n_as; i02++) {
             std::vector<mmid_row_mapping> row_mappings;
             int64_t num_src1_rows = 0;
 
+            void* src0_tmp_ptr = (char *)src0_original + i02*ori_src0_nb[2];
+            void* src1_tmp_ptr = (char *)src1_cont_buf + total_num_src1_rows * nb11;
+            void* dst_tmp_ptr = (char *)dst_cont_buf + total_num_src1_rows * nb1;
             for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
                 for (int64_t id = 0; id < n_ids; id++) {
                     int32_t row_id_i = *(int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
@@ -2686,54 +2728,91 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
                         mapping.i1 = static_cast<int32_t>(id);
                         mapping.i2 = static_cast<int32_t>(iid1);
                         row_mappings.push_back(mapping);
-                        num_src1_rows++;
 
                         int64_t read_b = (ne11 == 1 ? 0 : id);
                         char* src_ptr = src1_original
                                         + read_b      * nb11
                                         + mapping.i2 * nb12;
-                        char* dst_ptr = (char*)src1_cont_buf + (num_src1_rows - 1) * nb11;
-                        ACL_CHECK(aclrtMemcpyAsync(dst_ptr, nb11, src_ptr, nb11,
-                            ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+                        char* dst_ptr = (char*)src1_cont_buf + total_num_src1_rows * nb11;
+                        ggml_cann_async_memcpy(ctx, dst_ptr, src_ptr, nb11,
+                            ACL_MEMCPY_DEVICE_TO_DEVICE);
+                        
+                        num_src1_rows++;
+                        total_num_src1_rows++;
                     }
                 }
             }
+        
+            // expert_map index is expert index
+            expert_mapping expert_map;
+            expert_map.row_mappings = row_mappings;
+            expert_map.num_src1_rows = num_src1_rows;
+            expert_map.offset = total_num_src1_rows - num_src1_rows;
+            expert_mappings.push_back(expert_map);
 
             if (num_src1_rows == 0) {
                 continue;
             }
 
-            // src0_row [D, M, 1, 1]
-            src0_row.data = src0_original + i02 * nb02;
+            // src0_row [M, D] -> weight && permute
+            int64_t src0_ne[2] = {ne01, ne00};
+            size_t src0_nb[2] = {ori_src0_nb[1], ori_src0_nb[0]};
+            // src1_row [D, num_src1_rows] -> input
+            int64_t src1_ne[2] = {ne10, num_src1_rows};
+            size_t src1_nb[2] = {nb10, nb11};
+            // dst_row [M, num_src1_rows] -> out
+            int64_t dst_ne[2] = {ne0, num_src1_rows};
+            size_t dst_nb[2] = {nb0, nb1};
 
-            // src1_row [D, The number of values ​​in K * N is i02, 1, 1]
-            src1_row.ne[1] = num_src1_rows;
-            src1_row.nb[1] = nb11;
-            src1_row.nb[2] = num_src1_rows * nb11;
-            src1_row.nb[3] = num_src1_rows * nb11;
+            aclTensor* acl_src0 = ggml_cann_create_tensor(src0_tmp_ptr,
+                ACL_FLOAT, sizeof(float),
+                src0_ne, src0_nb, 2);
+            aclTensor* acl_src1 = ggml_cann_create_tensor(src1_tmp_ptr,
+                ACL_FLOAT, sizeof(float),
+                src1_ne, src1_nb, 2);
+            aclTensor* acl_dst = ggml_cann_create_tensor(dst_tmp_ptr,
+                ACL_FLOAT, sizeof(float),
+                dst_ne, dst_nb, 2);
 
-            // dst_row [D, The number of values ​​in K * N is i02, 1, 1]
-            dst_row.ne[1] = num_src1_rows;
-            dst_row.nb[1] = nb1;
-            dst_row.nb[2] = num_src1_rows * nb1;
-            dst_row.nb[3] = num_src1_rows * nb1;
+            src0_tensor_vec.push_back(acl_src0);
+            src1_tensor_vec.push_back(acl_src1);
+            dst_tensor_vec.push_back(acl_dst);
+        }
+        aclTensorList* src0_tensor_list = aclCreateTensorList(src0_tensor_vec.data(), src0_tensor_vec.size());
+        aclTensorList* src1_tensor_list = aclCreateTensorList(src1_tensor_vec.data(), src1_tensor_vec.size());
+        aclTensorList* dst_tensor_list = aclCreateTensorList(dst_tensor_vec.data(), dst_tensor_vec.size());
 
-            dst_row.src[0] = &src0_row;
-            dst_row.src[1] = &src1_row;
+        GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV2, src1_tensor_list, src0_tensor_list,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, -1, dst_tensor_list);
 
-            ggml_cann_mul_mat(ctx, &dst_row);
+        for (size_t i = 0; i < expert_mappings.size(); ++i) {
+            expert_mapping expert_map = expert_mappings[i];
+            for (int64_t j = 0; j < expert_map.num_src1_rows; ++j) {
+                int64_t i1 = expert_map.row_mappings[j].i1;
+                int64_t i2 = expert_map.row_mappings[j].i2;
 
-            for (int64_t i = 0; i < num_src1_rows; ++i) {
-                int64_t i1 = row_mappings[i].i1;
-                int64_t i2 = row_mappings[i].i2;
-
-                char* src_ptr = (char*)dst_cont_buf + i * nb1;
+                char* src_ptr = (char*)dst_cont_buf + expert_map.offset * nb1 + j * nb1;
                 char* dst_ptr = dst_original + i1 * nb1 + i2 * nb2;
 
-                ACL_CHECK(aclrtMemcpyAsync(dst_ptr, nb1, src_ptr, nb1,
-                    ACL_MEMCPY_DEVICE_TO_DEVICE, ctx.stream()));
+                ggml_cann_async_memcpy(ctx, dst_ptr, src_ptr, nb1,
+                    ACL_MEMCPY_DEVICE_TO_DEVICE);
             }
-        }
+
+        }  
+        ggml_cann_release_resources(ctx, src0_tensor_list, src1_tensor_list, dst_tensor_list);
     }
     return;
+}
+
+void ggml_cann_mul_mat_id(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
+    const enum ggml_type type = dst->src[0]->type;
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+            ggml_cann_mul_mat_id_fp(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("Unsupported type for mul_mat_id");
+            break;
+    }
 }
