@@ -2600,7 +2600,25 @@ void ggml_cann_step(ggml_backend_cann_context& ctx, ggml_tensor* dst){
     ggml_cann_release_resources(ctx, acl_src, acl_dst, alpha);
 }
 
-void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
+/**
+ * @brief Performs expert-specific matrix multiplication (MoE) with 
+ * floating-point precision using the CANN backend.
+ *
+ * This function executes a matrix multiplication operation tailored for
+ * Mixture of Experts (MoE) models, where the input tensor is multiplied
+ * with expert-specific weight matrices. It uses the CANN backend for
+ * efficient computation and stores the result in the destination tensor `dst`.
+ * The operation may leverage identity-based optimizations or routing masks
+ * as part of sparse expert selection.
+ *
+ * @param ctx The context for executing CANN backend operations.
+ * @param dst The destination tensor where the MoE multiplication result 
+ * will be stored.
+ *
+ * @note This function assumes floating-point data types and is designed for
+ * MoE architectures, possibly involving sparse expert routing.
+ */
+static void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     //dst   [M, K, N, 1]
     ggml_tensor * src0 = dst->src[0];  //src0	[D, M, A, 1]
     ggml_tensor * src1 = dst->src[1];  //src1	[D, B, N, 1], B = K or B = 1
