@@ -2631,9 +2631,8 @@ static void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context& ctx, ggml_tensor*
     int64_t n_ids = ids->ne[0]; // K
 
     std::vector<char> ids_host(ggml_nbytes(ids));
-    char * ids_dev = (char *) ids->data;
-    ACL_CHECK(aclrtMemcpyAsync(ids_host.data(), ggml_nbytes(ids), ids_dev, ggml_nbytes(ids),
-        ACL_MEMCPY_DEVICE_TO_HOST, ctx.stream()));
+    ggml_cann_async_memcpy(ctx, ids_host.data(), ids->data, ggml_nbytes(ids),
+        ACL_MEMCPY_DEVICE_TO_HOST);
     ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
 
     char * src0_original = (char *) src0->data;
@@ -2667,7 +2666,7 @@ static void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context& ctx, ggml_tensor*
     std::vector<aclTensor*> src1_tensor_vec;
     std::vector<aclTensor*> dst_tensor_vec;
     // ne12 == ids->ne[1] == N
-    if (ne12 == 1) {
+    if (true) {
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 // src0_row [M, D] -> weight && permute
@@ -2710,14 +2709,28 @@ static void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context& ctx, ggml_tensor*
                 dst_tensor_vec.push_back(acl_dst);
             }
         }
-        aclTensorList* src0_tensor_list = aclCreateTensorList(src0_tensor_vec.data(), src0_tensor_vec.size());
-        aclTensorList* src1_tensor_list = aclCreateTensorList(src1_tensor_vec.data(), src1_tensor_vec.size());
-        aclTensorList* dst_tensor_list = aclCreateTensorList(dst_tensor_vec.data(), dst_tensor_vec.size());
 
-        GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV2, src1_tensor_list, src0_tensor_list,
-            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, -1, dst_tensor_list);
+        // GroupedMatmulV2 required tensor_list.size < 128
+        size_t GROUP_SIZE = 128;
+        std::vector<std::vector<aclTensor*>> src0_tensor_vec_vec;
+        std::vector<std::vector<aclTensor*>> src1_tensor_vec_vec;
+        std::vector<std::vector<aclTensor*>> dst_tensor_vec_vec;
 
-        ggml_cann_release_resources(ctx, src0_tensor_list, src1_tensor_list, dst_tensor_list);
+        for (size_t i = 0; i < src0_tensor_vec.size(); i += GROUP_SIZE) {
+            size_t end = std::min(i + GROUP_SIZE, src0_tensor_vec.size());
+            std::vector<aclTensor*> src0_tensor_vec_split(src0_tensor_vec.begin() + i, src0_tensor_vec.begin() + end);
+            std::vector<aclTensor*> src1_tensor_vec_split(src1_tensor_vec.begin() + i, src1_tensor_vec.begin() + end);
+            std::vector<aclTensor*> dst_tensor_vec_split(dst_tensor_vec.begin() + i, dst_tensor_vec.begin() + end);
+
+            aclTensorList* src0_tensor_list = aclCreateTensorList(src0_tensor_vec_split.data(), src0_tensor_vec_split.size());
+            aclTensorList* src1_tensor_list = aclCreateTensorList(src1_tensor_vec_split.data(), src1_tensor_vec_split.size());
+            aclTensorList* dst_tensor_list = aclCreateTensorList(dst_tensor_vec_split.data(), dst_tensor_vec_split.size());
+
+            GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV2, src1_tensor_list, src0_tensor_list,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, -1, dst_tensor_list);
+
+            ggml_cann_release_resources(ctx, src0_tensor_list, src1_tensor_list, dst_tensor_list);
+        }
     } else {
         ggml_cann_pool_alloc src1_cont_allocator(
             ctx.pool(),sizeof(float) * ggml_nelements(src1) / ne11 * ids->ne[0]);
