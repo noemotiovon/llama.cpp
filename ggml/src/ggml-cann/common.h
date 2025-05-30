@@ -376,10 +376,10 @@ struct ggml_cann_graph {
     std::vector<ggml_graph_node_properties> ggml_graph_properties;
 
     // TODO: user cpy indirection
-    // bool use_cpy_indirection = false;
-    // std::vector<char *> cpy_dest_ptrs;
-    // char ** dest_ptrs_d = nullptr;
-    // int dest_ptrs_size = 0;
+    bool use_cpy_indirection = false;
+    std::vector<char *> cpy_dest_ptrs;
+    char ** dest_ptrs_d = nullptr;
+    int dest_ptrs_size = 0;
 
     int graph_cpynode_index = -1;
 #endif  // USE_CANN_GRAPH
