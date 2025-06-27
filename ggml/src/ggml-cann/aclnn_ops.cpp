@@ -65,7 +65,7 @@
 #include <aclnnop/aclnn_eq_tensor.h>
 #include <aclnnop/aclnn_gt_scalar.h>
 #include <aclnnop/aclnn_pow.h>
-#include <aclnnop/aclnn_grouped_matmul_v2.h>
+#include <aclnnop/aclnn_grouped_matmul_v3.h>
 #include <aclnnop/aclnn_fused_infer_attention_score_v2.h>
 #include <float.h>
 
@@ -2701,9 +2701,9 @@ static void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context& ctx, ggml_tensor*
     }
 
     size_t GROUP_SIZE = 128;
-    // GroupedMatmulV2 required tensor_list.size < 128
+    // GroupedMatmulV3 required tensor_list.size < 128
     for (size_t i = 0; i < src0_tensor_vec.size(); i += GROUP_SIZE) {
-        // split and call GroupedMatmulV2
+        // split and call GroupedMatmulV3
         size_t end = std::min(i + GROUP_SIZE, src0_tensor_vec.size());
         std::vector<aclTensor*> src0_tensor_vec_split(src0_tensor_vec.begin() + i, src0_tensor_vec.begin() + end);
         std::vector<aclTensor*> src1_tensor_vec_split(src1_tensor_vec.begin() + i, src1_tensor_vec.begin() + end);
@@ -2713,7 +2713,7 @@ static void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context& ctx, ggml_tensor*
         aclTensorList* src1_tensor_list = aclCreateTensorList(src1_tensor_vec_split.data(), src1_tensor_vec_split.size());
         aclTensorList* dst_tensor_list = aclCreateTensorList(dst_tensor_vec_split.data(), dst_tensor_vec_split.size());
 
-        GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV2, src1_tensor_list, src0_tensor_list,
+        GGML_CANN_CALL_ACLNN_OP(ctx, GroupedMatmulV3, src1_tensor_list, src0_tensor_list,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, -1, dst_tensor_list);
 
         ggml_cann_release_resources(ctx, src0_tensor_list, src1_tensor_list, dst_tensor_list);
