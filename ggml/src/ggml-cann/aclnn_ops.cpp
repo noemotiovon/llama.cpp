@@ -2658,7 +2658,7 @@ static void ggml_cann_mul_mat_id_fp(ggml_backend_cann_context& ctx, ggml_tensor*
     ggml_tensor src0_row = *src0;
     ggml_tensor src1_row = *src1;
     ggml_tensor dst_row = *dst;
-    
+
     if (src0->type == GGML_TYPE_F16) {
         src0_row.type = GGML_TYPE_F32;
     }
