@@ -337,6 +337,45 @@ private:
     int32_t device_;
 };
 
+// TODO: 删除 //
+// #if defined(GGML_CANN_USE_GRAPHS)
+#define USE_CANN_GRAPH
+// #endif
+
+#ifdef USE_CANN_GRAPH
+struct ggml_graph_node_properties {
+    void * node_address;
+    ggml_op node_op;
+    int64_t ne[GGML_MAX_DIMS];
+    size_t nb[GGML_MAX_DIMS];
+    void * src_address[GGML_MAX_SRC];
+    int32_t op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+};
+
+struct ggml_cann_graph {
+    ~ggml_cann_graph() {
+        if (graph != nullptr) {
+            aclmdlRIDestroy(graph);
+        }
+    }
+
+    aclmdlRI graph = nullptr;
+
+    aclrtTaskGrp taskGrpHandle;
+    size_t num_nodes = 0;
+
+    // bool disable_due_to_npu_arch = false;
+    bool disable_due_to_too_many_updates = false;
+    // bool disable_due_to_failed_graph_capture = false;
+    int number_consecutive_updates = 0;
+
+    std::vector<ggml_graph_node_properties> ggml_graph_properties;
+
+    std::vector<char *> cpy_dest_ptrs;
+    int dest_ptrs_size = 0;
+#endif  // USE_CANN_GRAPH
+};
+
 /**
  * @brief Context for managing CANN backend operations.
  */
@@ -345,6 +384,7 @@ struct ggml_backend_cann_context {
     std::string name;                /**< Name of the device. */
     std::string description;         /**< Description of the device. */
     aclrtEvent copy_event = nullptr; /**< Event for managing copy operations. */
+    std::unique_ptr<ggml_cann_graph> cann_graph;
     cann_task_queue task_queue;
     bool async_mode;
 
