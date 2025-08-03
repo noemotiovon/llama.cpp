@@ -1484,7 +1484,84 @@ static void aclnn_alibi(ggml_backend_cann_context& ctx, aclTensor* acl_src,
 }
 
 void ggml_cann_cpy(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
-    ggml_cann_dup(ctx, dst);
+    ggml_tensor* src0 = dst->src[0];
+    void* src_trans_buffer = src0->data;
+    ggml_cann_pool_alloc src_buffer_allocator;
+    if (!ggml_is_contiguous(src0)) {
+        aclTensor* acl_src = ggml_cann_create_tensor(src0);
+        src_buffer_allocator.alloc(ctx.pool(),
+            ggml_nelements(src0) * ggml_type_size(src0->type));
+        src_trans_buffer = src_buffer_allocator.get();
+        size_t src_trans_nb[GGML_MAX_DIMS];
+        src_trans_nb[0] = ggml_type_size(src0->type);
+        for (int i = 1; i < GGML_MAX_DIMS; i++) {
+            src_trans_nb[i] = src_trans_nb[i - 1] * src0->ne[i - 1];
+        }
+        aclTensor* src_trans_tensor = ggml_cann_create_tensor(
+            src_trans_buffer, ggml_cann_type_mapping(src0->type),
+            ggml_type_size(src0->type), src0->ne, src_trans_nb,
+            GGML_MAX_DIMS);
+        cann_copy(ctx, acl_src, src_trans_tensor);
+        ggml_cann_release_resources(ctx, acl_src, src_trans_tensor);
+    }
+
+    size_t src_reshape_nb[GGML_MAX_DIMS];
+    src_reshape_nb[0] = ggml_type_size(src0->type);
+    for (int i = 1; i < GGML_MAX_DIMS; i++) {
+        src_reshape_nb[i] = src_reshape_nb[i - 1] * dst->ne[i - 1];
+    }
+    
+    aclTensor* trans_acl_src = ggml_cann_create_tensor(src_trans_buffer, 
+        ggml_cann_type_mapping(src0->type),ggml_type_size(src0->type), 
+        dst->ne, src_reshape_nb, GGML_MAX_DIMS, ACL_FORMAT_ND);
+    // aclTensor* acl_dst = ggml_cann_create_tensor(dst);
+    // 使用固定地址
+    void * pre_allocated_dst = ctx.cann_graph->cpy_data_map[dst->data]; 
+    aclTensor* acl_dst = ggml_cann_create_tensor(pre_allocated_dst, 
+        ggml_cann_type_mapping(dst->type),ggml_type_size(dst->type), 
+        dst->ne, dst->nb, GGML_MAX_DIMS, ACL_FORMAT_ND);
+
+    if (dst->type == src0->type) {
+        cann_copy(ctx, trans_acl_src, acl_dst);
+    } else {
+        aclnn_cast(ctx, trans_acl_src, acl_dst, ggml_cann_type_mapping(dst->type));
+    }
+    
+    // 拷贝固定地址的数据到dst->data
+    if (ggml_is_contiguous(dst)) {
+        ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
+        aclrtSetMemcpyDesc(ctx.cann_graph->cpy_device_indirect_addr, 
+            ACL_MEMCPY_INNER_DEVICE_TO_DEVICE, pre_allocated_dst,
+            dst->data, ggml_nbytes(dst), NULL);
+        aclrtMemcpyAsyncWithDesc(ctx.cann_graph->cpy_device_indirect_addr,
+            ACL_MEMCPY_INNER_DEVICE_TO_DEVICE, ctx.stream());
+        ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
+    } else {
+        size_t line_bytes = dst->ne[0] * ggml_type_size(dst->type);  // 每次连续拷贝的行大小
+        char* src_ptr = (char*)pre_allocated_dst;
+        for (int i3 = 0; i3 < dst->ne[3]; i3++) {
+            for (int i2 = 0; i2 < dst->ne[2]; i2++) {
+                for (int i1 = 0; i1 < dst->ne[1]; i1++) {
+                    // 计算 dst 中当前 [i3][i2][i1][0] 的物理地址
+                    char* dst_ptr = (char*)dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3];
+                    // ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
+                    // aclrtSetMemcpyDesc(ctx.cann_graph->cpy_device_indirect_addr, 
+                    //     ACL_MEMCPY_INNER_DEVICE_TO_DEVICE, src_ptr,
+                    //     dst_ptr, line_bytes, NULL);
+                    // aclrtMemcpyAsyncWithDesc(ctx.cann_graph->cpy_device_indirect_addr,
+                    //     ACL_MEMCPY_INNER_DEVICE_TO_DEVICE, ctx.stream());
+                    // ACL_CHECK(aclrtSynchronizeStream(ctx.stream()));
+                    ggml_cann_async_memcpy(ctx, dst_ptr, src_ptr, line_bytes,
+                        ACL_MEMCPY_DEVICE_TO_DEVICE);
+                    aclrtSynchronizeStream(ctx.stream());
+                    // src 是连续的，每次推进一行
+                    src_ptr += line_bytes;
+                }
+            }
+        }
+    }
+    ggml_cann_release_resources(ctx, trans_acl_src, acl_dst);
+    return;
 }
 
 /**

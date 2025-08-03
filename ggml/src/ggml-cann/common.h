@@ -337,6 +337,108 @@ private:
     int32_t device_;
 };
 
+// TODO: 删除 //
+// #if defined(GGML_CANN_USE_GRAPHS)
+#define USE_CANN_GRAPH
+// #endif
+
+#ifdef USE_CANN_GRAPH
+struct ggml_graph_node_properties {
+    void * node_address;
+    ggml_op node_op;
+    int64_t ne[GGML_MAX_DIMS];
+    size_t nb[GGML_MAX_DIMS];
+    void * src_address[GGML_MAX_SRC];
+    int32_t op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t)];
+};
+
+struct device_buffer_pool {
+    void* base_addr = nullptr;      // 设备大内存起始地址
+    size_t total_size = 0;          // 总大小
+    size_t current_offset = 0;      // 当前偏移
+    static constexpr size_t DEVICE_ALIGNMENT = 64;
+
+    // 初始化（调用一次）
+    void init(size_t size) {
+        total_size = size;
+        ACL_CHECK(aclrtMalloc(&base_addr, total_size, ACL_MEM_MALLOC_HUGE_FIRST));
+        current_offset = 0;
+    }
+
+    // 分配子内存 slice，返回设备地址
+    
+    void* alloc_slice(size_t size) {
+        // 1. 计算对齐后的偏移
+        size_t aligned_offset = (current_offset + (DEVICE_ALIGNMENT - 1)) 
+                            & ~(DEVICE_ALIGNMENT - 1);
+
+        // 2. 检查越界
+        if (aligned_offset + size > total_size) {
+            throw std::runtime_error(
+                "OOM: device memory pool exhausted, "
+                "requested slice size = " + std::to_string(size) +
+                ", aligned_offset = " + std::to_string(aligned_offset) +
+                ", total_size = " + std::to_string(total_size)
+            );
+        }
+
+        // 3. 取得切片地址
+        void* slice_addr = static_cast<char*>(base_addr) + aligned_offset;
+        if (slice_addr == nullptr) {
+            throw std::runtime_error("Unexpected null slice address");
+        }
+
+        // 4. 更新偏移，准备下次分配
+        current_offset = aligned_offset + size;
+
+        return slice_addr;
+    }
+
+    // 释放所有slice（重置offset）
+    void reset() {
+        current_offset = 0;
+    }
+
+    // 释放大块设备内存（析构时调用）
+    void free() {
+        if (base_addr != nullptr) {
+            ACL_CHECK(aclrtFree(base_addr));
+            base_addr = nullptr;
+            total_size = 0;
+            current_offset = 0;
+        }
+    }
+};
+
+struct ggml_cann_graph {
+    ~ggml_cann_graph() {
+        if (graph != nullptr) {
+            aclmdlRIDestroy(graph);
+        }
+    }
+
+    aclmdlRI graph = nullptr;
+
+    aclrtTaskGrp taskGrpHandle;
+    size_t num_nodes = 0;
+
+    // bool disable_due_to_npu_arch = false;
+    bool disable_due_to_too_many_updates = false;
+    // bool disable_due_to_failed_graph_capture = false;
+    int number_consecutive_updates = 0;
+
+    std::vector<ggml_graph_node_properties> ggml_graph_properties;
+
+    void * cpy_device_addr = nullptr;
+    void * cpy_device_indirect_addr = nullptr;
+    device_buffer_pool cpy_device_buffer_pool;
+    
+    int graph_cpynode_index = -1;
+
+    std::unordered_map<void*, void*> cpy_data_map;
+#endif  // USE_CANN_GRAPH
+};
+
 /**
  * @brief Context for managing CANN backend operations.
  */
@@ -345,6 +447,7 @@ struct ggml_backend_cann_context {
     std::string name;                /**< Name of the device. */
     std::string description;         /**< Description of the device. */
     aclrtEvent copy_event = nullptr; /**< Event for managing copy operations. */
+    std::unique_ptr<ggml_cann_graph> cann_graph;
     cann_task_queue task_queue;
     bool async_mode;
 

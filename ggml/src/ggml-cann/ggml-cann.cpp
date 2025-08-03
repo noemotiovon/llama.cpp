@@ -2062,6 +2062,189 @@ static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
     ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
 }
 
+#ifdef USE_CANN_GRAPH
+
+static void update_ggml_cpy_dest(ggml_backend_cann_context * cann_ctx, ggml_cgraph * cgraph) {
+    // 全替换，精度不对
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (cann_ctx->cann_graph->cpy_data_map.count(node->data)) {
+            node->data = cann_ctx->cann_graph->cpy_data_map[node->data];
+        }
+        for (int i = 0; i < GGML_MAX_SRC; i++) {
+            if (node->src[i] == nullptr) {
+                continue;
+            }
+            if (cann_ctx->cann_graph->cpy_data_map.count(node->src[i]->data)) {
+                node->src[i]->data = cann_ctx->cann_graph->cpy_data_map[node->src[i]->data];
+            }
+        }
+    }
+}
+
+static bool check_node_graph_compatibility(ggml_backend_cann_context * cann_ctx, ggml_cgraph * cgraph) {
+    // Loop over nodes in GGML graph to obtain info needed for CANN graph
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+
+        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE ||
+            node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW ||
+            node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+            continue;
+        }
+
+        if (node->op == GGML_OP_MUL_MAT_ID && node->ne[2] != 1) {
+            return false; // This node type is not supported by CANN graph capture
+        }
+    }
+    return true;
+}
+
+static void build_cpy_dest_map(ggml_backend_cann_context * cann_ctx, ggml_cgraph * cgraph) {
+    cann_ctx->cann_graph->cpy_device_buffer_pool.reset();
+    cann_ctx->cann_graph->cpy_data_map.clear();
+
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_CPY) {
+            //size_t size = 1024 * 1024 * 10;
+            size_t size = ggml_nelements(node->src[1]) * node->src[1]->nb[0];
+            void* cpy_dst_ptr = cann_ctx->cann_graph->cpy_device_buffer_pool.alloc_slice(size);
+            cann_ctx->cann_graph->cpy_data_map[node->src[1]->data] = cpy_dst_ptr;
+            // aclrtMemcpy((char *)cpy_dst_ptr, size,
+            //     (const char *)node->src[1]->data, size, ACL_MEMCPY_DEVICE_TO_DEVICE);
+            // ACL_CHECK(aclrtMemcpyAsync(cpy_dst_ptr, size, node->src[1]->data, size,
+            //                 ACL_MEMCPY_DEVICE_TO_DEVICE,
+            //                 cann_ctx->stream()));
+            // 如果只拷贝CPY
+            // node->src[1]->data = cpy_dst_ptr;
+            // 执行下面的精度挂掉，虽然地址一样
+            // node->data = cpy_dst_ptr;
+            // printf("[build_cpy_dest_map] node[%d] OP: %d\n", i, node->op);
+            // printf("[build_cpy_dest_map] src1->data = %p, allocated cpy_dst_ptr = %p, size = %zu\n",
+            //     node->src[1]->data, cpy_dst_ptr, size);
+
+        }
+    }
+}
+
+static void set_ggml_graph_node_properties(ggml_backend_cann_context * cann_ctx, ggml_cgraph * cgraph) {
+    for (int node_idx = 0; node_idx < cgraph->n_nodes; node_idx++) {
+        ggml_tensor * node = cgraph->nodes[node_idx];
+        cann_ctx->cann_graph->ggml_graph_properties[node_idx].node_address = node->data;
+        cann_ctx->cann_graph->ggml_graph_properties[node_idx].node_op = node->op;
+        
+        for (int dim = 0; dim < GGML_MAX_DIMS; dim++) {
+            cann_ctx->cann_graph->ggml_graph_properties[node_idx].ne[dim] = node->ne[dim];
+            cann_ctx->cann_graph->ggml_graph_properties[node_idx].nb[dim] = node->nb[dim];
+        }
+        for (int src = 0; src < GGML_MAX_SRC; src++) {
+            cann_ctx->cann_graph->ggml_graph_properties[node_idx].src_address[src] = 
+                node->src[src] ? node->src[src]->data : nullptr;
+        }
+        memcpy(cann_ctx->cann_graph->ggml_graph_properties[node_idx].op_params, node->op_params, GGML_MAX_OP_PARAMS);
+    }
+}
+
+static bool ggml_graph_node_has_matching_properties(ggml_tensor * node, ggml_graph_node_properties * graph_node_properties) {
+    if (node->data != graph_node_properties->node_address &&
+          node->op != GGML_OP_CPY &&
+          node->op != GGML_OP_VIEW) {
+        return false;
+    }
+    if (node->op != graph_node_properties->node_op) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (node->ne[i] != graph_node_properties->ne[i]) {
+            return false;
+        }
+        if (node->nb[i] != graph_node_properties->nb[i]) {
+            return false;
+        }
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (node->src[i] &&
+            node->src[i]->data != graph_node_properties->src_address[i] &&
+            node->op != GGML_OP_CPY &&
+            node->op != GGML_OP_VIEW
+        ) {
+            return false;
+        }
+    }
+    if (node->op == GGML_OP_SCALE &&
+        memcmp(graph_node_properties->op_params, node->op_params, GGML_MAX_OP_PARAMS) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static bool is_cann_graph_update_required(ggml_backend_cann_context * cann_ctx, ggml_cgraph * cgraph) {
+    // 节点个数不同，需重新构图
+    if (cann_ctx->cann_graph->ggml_graph_properties.size() != (size_t)cgraph->n_nodes) {
+        cann_ctx->cann_graph->ggml_graph_properties.resize(cgraph->n_nodes);
+        return true;
+    }
+
+    // 节点个数相同，便利每个节点，比较其是否匹配
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        bool has_matching_properties = ggml_graph_node_has_matching_properties(
+            cgraph->nodes[i], &cann_ctx->cann_graph->ggml_graph_properties[i]);
+        if(!has_matching_properties) {
+            return true;
+        }
+    }
+    return false;
+}
+
+#endif  // USE_CANN_GRAPH
+
+
+static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx, ggml_cgraph * cgraph,
+    bool & graph_evaluated_or_captured, bool & use_cann_graph, bool & cann_graph_update_required) {
+    while (!graph_evaluated_or_captured) {
+        // Start CANN graph capture
+        if (use_cann_graph && cann_graph_update_required) {
+            if (cann_ctx->cann_graph->graph != nullptr) {
+                ACL_CHECK(aclmdlRIDestroy(cann_ctx->cann_graph->graph));
+                cann_ctx->cann_graph->graph = nullptr;
+            }
+            ACL_CHECK(aclmdlRICaptureBegin(cann_ctx->stream(), ACL_MODEL_RI_CAPTURE_MODE_GLOBAL));
+        }
+
+        // Only perform the graph execution if CANN graphs are not enabled, or we are capturing the graph.
+        // With the use of CANN graphs, the execution will be performed by the graph launch.
+        if (!use_cann_graph || cann_graph_update_required) {
+            for (int i = 0; i < cgraph->n_nodes; i++) {
+                ggml_tensor * node = cgraph->nodes[i];
+
+                if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+                    continue;
+                }
+
+                bool ok = ggml_cann_compute_forward(*cann_ctx, node);
+                if (!ok) {
+                    GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                }
+                GGML_ASSERT(ok);
+            }
+        }
+
+        if (use_cann_graph && cann_graph_update_required) { // End CANN graph capture
+            ACL_CHECK(aclmdlRICaptureEnd(cann_ctx->stream(), &cann_ctx->cann_graph->graph));
+            graph_evaluated_or_captured = true; // CANN graph has been captured
+        } else {
+            graph_evaluated_or_captured = true; // ggml graph has been directly evaluated
+        }
+    }
+
+    if (use_cann_graph) {
+        // Launch graph
+        ACL_CHECK(aclmdlRIExecuteAsync(cann_ctx->cann_graph->graph, cann_ctx->stream()));
+    }
+}
+
+
 /**
  * @brief Computes a computational graph using a CANN backend.
  *
@@ -2078,25 +2261,33 @@ static enum ggml_status ggml_backend_cann_graph_compute(
     ggml_backend_t backend, ggml_cgraph* cgraph) {
     ggml_backend_cann_context* cann_ctx =
         (ggml_backend_cann_context*)backend->context;
-
     ggml_cann_set_device(cann_ctx->device);
-
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_tensor* node = cgraph->nodes[i];
-
-        if (ggml_is_empty(node) || node->op == GGML_OP_NONE) {
-            continue;
-        }
-
-        bool ok = ggml_cann_compute_forward(*cann_ctx, node);
-
-        if (!ok) {
-            GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__,
-                    node->name, ggml_op_name(node->op));
-        }
-        GGML_ASSERT(ok);
+    bool use_cann_graph = true;
+    bool cann_graph_update_required = false;
+    if (cann_ctx->cann_graph == nullptr) {
+        cann_ctx->cann_graph.reset(new ggml_cann_graph());
+        cann_graph_update_required = true;
+        cann_ctx->cann_graph->cpy_device_buffer_pool.init(1024 * 1024 * 1024);
+        //ACL_CHECK(aclrtMalloc(&cann_ctx->cann_graph->cpy_device_addr, 1024*1024*1024, ACL_MEM_MALLOC_HUGE_FIRST));
+        size_t descSize = 0;
+        aclrtGetMemcpyDescSize(ACL_MEMCPY_INNER_DEVICE_TO_DEVICE, &descSize);
+        ACL_CHECK(aclrtMalloc(&cann_ctx->cann_graph->cpy_device_indirect_addr, descSize, ACL_MEM_MALLOC_HUGE_FIRST));
+        ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
     }
 
+    build_cpy_dest_map(cann_ctx, cgraph);
+    //update_ggml_cpy_dest(cann_ctx, cgraph);
+    cann_graph_update_required = is_cann_graph_update_required(cann_ctx, cgraph);
+    use_cann_graph = check_node_graph_compatibility(cann_ctx, cgraph);
+    
+    set_ggml_graph_node_properties(cann_ctx, cgraph);
+
+    // cann_graph_update_required = false;
+    // 如果要不走图打开下面的配置
+    // use_cann_graph = false;
+
+    bool graph_evaluated_or_captured = false;
+    evaluate_and_capture_cann_graph(cann_ctx, cgraph, graph_evaluated_or_captured, use_cann_graph, cann_graph_update_required);
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2211,12 +2402,6 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev,
                 // only support F32 and F16.
                 return false;
             }
-
-            if (!ggml_are_same_shape(op, src) && !ggml_is_contiguous(op)) {
-                // unsupport dst is not contiguous.
-                return false;
-            }
-
             return true;
         } break;
         case GGML_OP_CONT: {
