@@ -56,6 +56,9 @@ aclTensor* ggml_cann_create_tensor(const ggml_tensor* tensor, int64_t* ne,
                                    size_t offset) {
     // If tensor is bcasted, Up to GGML_MAX_DIMS additional dimensions will be
     // added.
+    if (tensor == nullptr) {
+        return nullptr;
+    }
     int64_t acl_ne[GGML_MAX_DIMS * 2], acl_stride[GGML_MAX_DIMS * 2];
 
     if (ne == nullptr) {

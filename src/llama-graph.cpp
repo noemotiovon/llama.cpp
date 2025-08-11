@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -644,6 +645,15 @@ ggml_tensor * llm_graph_context::build_ffn(
      llm_ffn_op_type   type_op,
    llm_ffn_gate_type   type_gate,
                  int   il) const {
+    if (cparams.ffn) {
+        // gate is not null
+        cur = ggml_ffn_ext(ctx0, cur, up, up_b, up_s, gate, gate_b, 
+            gate_s, down, down_b, down_s, act_scales, type_op, type_gate);
+        return cur;
+    }
+    // std::cout << "lcg type_op===>>>" << type_op << std::endl; // 0.5b == 0 LLM_FFN_SILU
+    // std::cout << "lcg type_gate===>>>" << type_gate << std::endl; // 0.5b == 1 LLM_FFN_PAR
+
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
     cb(tmp, "ffn_up", il);
 

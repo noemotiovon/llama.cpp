@@ -70,6 +70,7 @@
 #include <aclnnop/aclnn_zero.h>
 #include <aclnnop/aclnn_index_copy.h>
 #include <aclnnop/aclnn_index_select.h>
+#include <aclnnop/aclnn_ffn_v3.h>
 #include <float.h>
 
 #include <cmath>
@@ -3396,4 +3397,209 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context& ctx, ggml_tensor* dst){
     }else{
         GGML_ABORT("Function is not implemented.");
     }
+}
+
+#include <cstdio>
+#include <inttypes.h> 
+
+void print_tensor_ne_nb(const char* name, const ggml_tensor* tensor) {
+    if(tensor == nullptr) {
+        return;
+    }
+    printf("%s ne: [", name);
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        printf("%" PRId64, tensor->ne[i]);
+        if (i != GGML_MAX_DIMS - 1) printf(", ");
+    }
+    printf("]\n");
+
+    printf("%s nb: [", name);
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        printf("%zu", tensor->nb[i]);
+        if (i != GGML_MAX_DIMS - 1) printf(", ");
+    }
+    printf("]\n");
+}
+
+void ggml_cann_ffn(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
+    
+    ggml_tensor * cur = dst->src[0];
+    ggml_tensor * up  = dst->src[1];   // W1 part A
+    ggml_tensor * up_b = dst->src[2];  // bias1 part A (可选)
+    ggml_tensor * up_s = dst->src[3];  // scale1 part A (可选)
+    ggml_tensor * gate = dst->src[4];  // W1 part B (可选)
+    ggml_tensor * gate_b = dst->src[5];
+    ggml_tensor * gate_s = dst->src[6];
+    ggml_tensor * down = dst->src[7];  // W2
+    ggml_tensor * down_b = dst->src[8];
+    ggml_tensor * down_s = dst->src[9];
+
+    // print_tensor_ne_nb("cur", cur);
+    // print_tensor_ne_nb("up", up);
+    // print_tensor_ne_nb("up_b", up_b);
+    // print_tensor_ne_nb("up_s", up_s);
+    // print_tensor_ne_nb("gate", gate);
+    // print_tensor_ne_nb("gate_b", gate_b);
+    // print_tensor_ne_nb("gate_s", gate_s);
+    // print_tensor_ne_nb("down", down);
+    // print_tensor_ne_nb("down_b", down_b);
+    // print_tensor_ne_nb("down_s", down_s);
+    // print_tensor_ne_nb("dst", dst);
+
+    // --- 创建 ACL 张量 ---
+    aclTensor* acl_cur = ggml_cann_create_tensor(cur, cur->ne, cur->nb, 2);
+    aclTensor* acl_up  = ggml_cann_create_tensor(up,  up->ne,  up->nb,  2);
+
+    ggml_cann_pool_alloc cur_cast_buffer_allocator(
+        ctx.pool(),
+        ggml_nelements(cur) * sizeof(uint16_t));
+    void* cur_cast_buffer = cur_cast_buffer_allocator.get();
+
+    // 2. 计算 strides（以字节为单位）
+    size_t cur_cast_nb[2];
+    cur_cast_nb[0] = sizeof(uint16_t) ;
+    for (int i = 1; i < 2; i++) {
+        cur_cast_nb[i] = cur_cast_nb[i - 1] * cur->ne[i - 1];
+    }
+
+    // 3. 创建临时目标 tensor（dtype 为目标类型）
+    aclTensor* acl_cur_cast = ggml_cann_create_tensor(
+        cur_cast_buffer,
+        ACL_FLOAT16,
+        sizeof(uint16_t),
+        cur->ne,
+        cur_cast_nb,
+        2);
+    aclnn_cast(ctx, acl_cur, acl_cur_cast, ACL_FLOAT16);
+
+    int64_t down_ne_target[2];
+    // axis 0 is concat dim:
+    down_ne_target[0] = down->ne[1];
+    down_ne_target[1] = down->ne[0];
+    size_t down_nb_target[2];
+    down_nb_target[0] = down->nb[1]; // fastest axis stride
+    down_nb_target[1] = down->nb[0];
+    aclTensor* acl_down = ggml_cann_create_tensor(down, down_ne_target, down_nb_target, 2);
+    aclTensor* acl_dst = ggml_cann_create_tensor(dst, dst->ne, dst->nb, 2);
+
+    // --- 构造 weight1 = concat(up, gate) ---
+    // 假设 up/gate layout: [K1, N1] ，我们要在第0维进行 concat -> new shape [K1_up + K1_gate, N1]
+    // 计算 concat 后目标 tensor 的 ne 和 nb（nb: bytes stride for each axis）
+    int64_t weight1_ne[2];
+    // axis 0 is concat dim:
+    weight1_ne[0] = up->ne[0];
+    weight1_ne[1] = up->ne[1]  + (gate ? gate->ne[1] : 0);
+    size_t bytes_elem = ggml_type_size(up->type);
+    // nb: stride per axis; for row-major with axes [A, B]:
+    size_t weight1_nb[2];
+    weight1_nb[0] = bytes_elem; // fastest axis stride
+    weight1_nb[1] = weight1_nb[0] * weight1_ne[0];
+
+    ggml_cann_pool_alloc weight1_allocator(ctx.pool(), ggml_nbytes(up) + (gate ? ggml_nbytes(gate) : 0));
+    void* weight1_buffer = weight1_allocator.get();
+    aclTensor* acl_weight1 =  ggml_cann_create_tensor(weight1_buffer, ggml_cann_type_mapping(up->type),
+        ggml_type_size(up->type), weight1_ne, weight1_nb, 2);
+    if (gate) {
+        aclTensor* acl_gate  = ggml_cann_create_tensor(gate, gate->ne, gate->nb, 2);
+        aclTensor* weight1_tensors[2] = { acl_up, acl_gate };
+        aclTensorList* weight1_list = aclCreateTensorList(weight1_tensors, 2);
+        aclnn_concat(ctx, weight1_list, acl_weight1, /*concat_dim=*/0);                
+        // ggml_cann_release_resources(ctx, acl_gate, weight1_list); ??为什么报错？
+    } else {
+        // 直接拷贝 up 内容到 weight1_buffer，或用 aclnnCopy
+    }
+
+    int64_t weight1_ne_target[2];
+    // axis 0 is concat dim:
+    weight1_ne_target[0] = weight1_ne[1];
+    weight1_ne_target[1] = weight1_ne[0];
+    size_t weight1_nb_targer[2];
+    weight1_nb_targer[0] = weight1_nb[1]; // fastest axis stride
+    weight1_nb_targer[1] = weight1_nb[0];
+    aclTensor* acl_weight_tensor  = ggml_cann_create_tensor(weight1_buffer, ggml_cann_type_mapping(up->type),
+        ggml_type_size(up->type),weight1_ne_target, weight1_nb_targer, 2);
+
+    // --- 构造 weight2 (down) ---
+    // 对于 W2 通常不需要 concat（除非 MoE），直接传 acl_down
+    aclTensor* acl_weight2 = acl_down;
+
+    // --- bias1: concat up_b and gate_b if存在 ---
+    aclTensor* acl_bias1 = nullptr;
+    if (up_b || gate_b) {
+        // size_t b_elem_size = ggml_type_size((up_b? up_b : gate_b)->type);
+        // int64_t bias1_ne[1] = { (up_b ? up_b->ne[0] : 0) + (gate_b ? gate_b->ne[0] : 0) };
+        // size_t bias1_nb[1] = { b_elem_size };
+        // ggml_cann_pool_alloc bias1_allocator(ctx.pool(), (up_b? ggml_nbytes(up_b):0) + (gate_b? ggml_nbytes(gate_b):0));
+        // void* bias1_buf = bias1_allocator.get();
+        // acl_bias1 = ggml_cann_create_tensor(bias1_buf, ggml_cann_type_mapping((up_b? up_b:gate_b)->type),
+        //                                    bias1_ne, bias1_nb, 1);
+        // concat 实现同上，concat_dim = 0
+    }
+
+    // --- scale1 / offset / deqScale / antiquant ... 等同理创建，如果没有则传 nullptr ---
+    aclTensor* acl_scale1 = nullptr;
+    if (up_s || gate_s) {
+        // create concat scale tensor (per-tensor或per-channel按需）
+    }
+
+
+    // --- activation / innerPrecise / tokensIndexFlag / expertTokensOptional ---
+    const char* activation = "swiglu";
+    int64_t innerPrecise = 1; // 或 0, 1表示高性能，0表示高精度
+    bool tokensIndexFlag = false;
+    aclTensor* expertTokensOpt = nullptr; // 如果 MoE 场景需创建
+
+
+    ggml_cann_pool_alloc dst_cast_buffer_allocator(
+        ctx.pool(), ggml_nelements(dst) * sizeof(uint16_t));
+    void* dst_cast_buffer = dst_cast_buffer_allocator.get();
+
+    // 2. 计算 strides（以字节为单位）
+    size_t dst_cast_nb[2];
+    dst_cast_nb[0] = sizeof(uint16_t) ;
+    for (int i = 1; i < 2; i++) {
+        dst_cast_nb[i] = dst_cast_nb[i - 1] * dst->ne[i - 1];
+    }
+
+    // 3. 创建临时目标 tensor（dtype 为目标类型）
+    aclTensor* acl_dst_cast = ggml_cann_create_tensor(
+        dst_cast_buffer,
+        ACL_FLOAT16,
+        sizeof(uint16_t),
+        dst->ne,
+        dst_cast_nb,
+        2);
+    // aclnn_cast(ctx, acl_cur, acl_dst_cast, ACL_FLOAT16);
+                // size_t cpy_size = ggml_nbytes(dst);
+                // ggml_cann_async_memcpy(ctx, dst->data, src_trans_buffer, cpy_size,
+                //     ACL_MEMCPY_DEVICE_TO_DEVICE);
+                // ggml_cann_release_resources(ctx, src_trans_tensor);
+    
+
+    // std::cout << "lcg===" << std::endl;
+    GGML_CANN_CALL_ACLNN_OP(ctx, FFNV3,
+        acl_cur_cast,
+        acl_weight_tensor,
+        acl_weight2,
+        expertTokensOpt,
+        acl_bias1,
+        /* bias2 */ (down_b ? ggml_cann_create_tensor(down_b, down_b->ne, down_b->nb, 1) : nullptr),
+        acl_scale1,
+        /* offset */ nullptr,
+        /* deqScale1 */ nullptr,
+        /* deqScale2 */ nullptr,
+        /* antiquantScale1 */ nullptr,
+        /* antiquantScale2 */ nullptr,
+        /* antiquantOffset1 */ nullptr,
+        /* antiquantOffset2 */ nullptr,
+        activation,
+        innerPrecise,
+        tokensIndexFlag,
+        acl_dst_cast
+    );
+
+    aclnn_cast(ctx, acl_dst_cast, acl_dst, ACL_FLOAT);
+    
+    ggml_cann_release_resources(ctx, acl_cur, acl_up, acl_down, acl_dst);
+
 }
