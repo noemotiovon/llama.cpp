@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
@@ -1470,6 +1471,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, v_mla, nullptr, kq_scale);
+    //std::cout << "lcg==>>cur - build_attn_mha" << cur->type << std::endl;
     cb(cur, "kqv_out", il);
 
     if (wo) {

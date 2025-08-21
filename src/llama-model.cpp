@@ -24,6 +24,8 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <iostream>
+
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -8150,16 +8152,19 @@ struct llm_build_qwen2 : public llm_graph_context {
 
         ggml_tensor * cur;
         ggml_tensor * inpL;
-
+        //std::cout << "lcg ===>>model.tok_embd" << model.tok_embd->type << std::endl;
         inpL = build_inp_embd(model.tok_embd);
+        //std::cout << "lcg ===>>inpL" << inpL->type << std::endl;
 
         // inp_pos - contains the positions
         ggml_tensor * inp_pos = build_inp_pos();
+        //std::cout << "lcg ===>>inp_pos" << inp_pos->type << std::endl;
 
         auto * inp_attn = build_attn_inp_kv_unified();
+        // std::cout << "lcg ===>>inp_pos" << inp_attn->type << std::endl;
 
         ggml_tensor * inp_out_ids = build_inp_out_ids();
-
+        
         for (int il = 0; il < n_layer; ++il) {
             ggml_tensor * inpSA = inpL;
 
@@ -8167,6 +8172,7 @@ struct llm_build_qwen2 : public llm_graph_context {
             cur = build_norm(inpL,
                     model.layers[il].attn_norm, NULL,
                     LLM_NORM_RMS, il);
+            //std::cout << "lcg ===>>cur" << cur->type << std::endl;
             cb(cur, "attn_norm", il);
 
             // self-attention
@@ -8175,14 +8181,17 @@ struct llm_build_qwen2 : public llm_graph_context {
                 ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
                 Qcur = ggml_add(ctx0, Qcur, model.layers[il].bq);
                 cb(Qcur, "Qcur", il);
+                //std::cout << "lcg ===>>Qcur" << Qcur->type << std::endl;
 
                 ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
                 Kcur = ggml_add(ctx0, Kcur, model.layers[il].bk);
                 cb(Kcur, "Kcur", il);
+                //std::cout << "lcg ===>>Kcur" << Kcur->type << std::endl;
 
                 ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
                 Vcur = ggml_add(ctx0, Vcur, model.layers[il].bv);
                 cb(Vcur, "Vcur", il);
+                //std::cout << "lcg ===>>Vcur" << Vcur->type << std::endl;
 
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
                 Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -8193,12 +8202,14 @@ struct llm_build_qwen2 : public llm_graph_context {
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow
                         );
+                //std::cout << "lcg ===>>RopeQcur" << Qcur->type << std::endl;
 
                 Kcur = ggml_rope_ext(
                         ctx0, Kcur, inp_pos, nullptr,
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow
                         );
+                //std::cout << "lcg ===>>RopeKcur" << Kcur->type << std::endl;
 
                 cb(Qcur, "Qcur", il);
                 cb(Kcur, "Kcur", il);
@@ -8207,6 +8218,7 @@ struct llm_build_qwen2 : public llm_graph_context {
                 cur = build_attn(inp_attn,
                         model.layers[il].wo, model.layers[il].bo,
                         Qcur, Kcur, Vcur, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+                //std::cout << "lcg ===>>Attencur1" << cur->type << std::endl;
             }
 
             if (il == n_layer - 1 && inp_out_ids) {
@@ -8215,12 +8227,14 @@ struct llm_build_qwen2 : public llm_graph_context {
             }
 
             ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+            //std::cout << "lcg ===>>ffn_inp" << ffn_inp->type << std::endl;
             cb(ffn_inp, "ffn_inp", il);
 
             // feed-forward network
             cur = build_norm(ffn_inp,
                     model.layers[il].ffn_norm, NULL,
                     LLM_NORM_RMS, il);
+            //std::cout << "lcg ===>>Endcur1" << cur->type << std::endl;
             cb(cur, "ffn_norm", il);
 
             cur = build_ffn(cur,
@@ -8229,11 +8243,14 @@ struct llm_build_qwen2 : public llm_graph_context {
                     model.layers[il].ffn_down, NULL, NULL,
                     NULL,
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
+            //std::cout << "lcg ===>>FFNcur" << cur->type << std::endl;
             cb(cur, "ffn_out", il);
 
             cur = ggml_add(ctx0, cur, ffn_inp);
+            //std::cout << "lcg ===>>ENDcur" << cur->type << std::endl;
 
             cur = build_cvec(cur, il);
+            //std::cout << "lcg ===>>ENDcur2" << cur->type << std::endl;
             cb(cur, "l_out", il);
 
             // input for next layer
@@ -8245,12 +8262,14 @@ struct llm_build_qwen2 : public llm_graph_context {
         cur = build_norm(cur,
                 model.output_norm, NULL,
                 LLM_NORM_RMS, -1);
+        //std::cout << "lcg ===>>Outcur2" << cur->type << std::endl;
 
         cb(cur, "result_norm", -1);
         res->t_embd = cur;
-
+        
+        //std::cout << "lcg ===>>model.output" << model.output->type << std::endl;
         // lm_head
-        cur = build_lora_mm(model.output, cur);
+        cur = build_lora_mm(model.output, cur);    
 
         if (model.output_b != nullptr) {
             cur = ggml_add(ctx0, cur, model.output_b);
@@ -18132,7 +18151,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 padding);
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
-
                         res = new llama_kv_cache_unified(
                                 *this,
                                 nullptr,

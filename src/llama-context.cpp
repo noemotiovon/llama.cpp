@@ -849,7 +849,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits != nullptr);
 
-        ggml_backend_tensor_get_async(backend_res, t_logits, logits, 0, n_tokens*n_vocab*sizeof(float));
+        ggml_backend_tensor_get_async(backend_res, t_logits, logits, 0, n_tokens*n_vocab*sizeof(uint16_t));
     }
 
     // extract embeddings
@@ -864,7 +864,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
                     GGML_ASSERT(embd != nullptr);
 
                     GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_size);
-                    ggml_backend_tensor_get_async(backend_embd, t_embd, embd, 0, n_tokens*n_embd*sizeof(float));
+                    ggml_backend_tensor_get_async(backend_embd, t_embd, embd, 0, n_tokens*n_embd*sizeof(uint16_t));
                 } break;
             case LLAMA_POOLING_TYPE_MEAN:
             case LLAMA_POOLING_TYPE_CLS:
@@ -878,7 +878,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
                         const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                         embd_seq_out[seq_id].resize(n_embd);
-                        ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd*seq_idx)*sizeof(float), n_embd*sizeof(float));
+                        ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd*seq_idx)*sizeof(uint16_t), n_embd*sizeof(uint16_t));
                     }
                 } break;
             case LLAMA_POOLING_TYPE_RANK:
@@ -893,7 +893,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
                         const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                         embd_seq_out[seq_id].resize(n_cls_out);
-                        ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_cls_out*seq_idx)*sizeof(float), n_cls_out*sizeof(float));
+                        ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_cls_out*seq_idx)*sizeof(uint16_t), n_cls_out*sizeof(uint16_t));
                     }
                 } break;
             case LLAMA_POOLING_TYPE_UNSPECIFIED:
@@ -1124,7 +1124,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits_size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(uint16_t));
             }
         }
 
@@ -1143,7 +1143,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         if (n_outputs) {
                             GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                             GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd <= (int64_t) embd_size);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd*sizeof(float));
+                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd*sizeof(uint16_t));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_MEAN:
@@ -1158,7 +1158,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                             embd_seq_out[seq_id].resize(n_embd);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd*seq_idx)*sizeof(float), n_embd*sizeof(float));
+                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd*seq_idx)*sizeof(uint16_t), n_embd*sizeof(uint16_t));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_RANK:
@@ -1173,7 +1173,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                             embd_seq_out[seq_id].resize(n_cls_out);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_cls_out*seq_idx)*sizeof(float), n_cls_out*sizeof(float));
+                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_cls_out*seq_idx)*sizeof(uint16_t), n_cls_out*sizeof(uint16_t));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_UNSPECIFIED:
@@ -1280,7 +1280,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     }
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
-    const size_t new_size  = (logits_size + embd_size) * sizeof(float);
+    const size_t new_size  = (logits_size + embd_size) * sizeof(uint16_t);
 
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
@@ -1854,7 +1854,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
         io.write(&logits_size, sizeof(logits_size));
 
         if (logits_size) {
-            io.write(logits, logits_size * sizeof(float));
+            io.write(logits, logits_size * sizeof(uint16_t));
         }
     }
 
@@ -1867,7 +1867,7 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
         io.write(&embd_size, sizeof(embd_size));
 
         if (embd_size) {
-            io.write(embd, embd_size * sizeof(float));
+            io.write(embd, embd_size * sizeof(uint16_t));
         }
     }
 
@@ -1937,7 +1937,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
         }
 
         if (logits_size) {
-            io.read_to(this->logits, logits_size * sizeof(float));
+            io.read_to(this->logits, logits_size * sizeof(uint16_t));
         }
     }
 
@@ -1953,7 +1953,7 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
         }
 
         if (embd_size) {
-            io.read_to(this->embd, embd_size * sizeof(float));
+            io.read_to(this->embd, embd_size * sizeof(uint16_t));
         }
     }
 
@@ -2166,7 +2166,7 @@ void llama_context::opt_epoch_iter(
                 for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                     const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
                     GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                    ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                    ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(uint16_t), sizeof(uint16_t));
                 }
             }
             ggml_opt_eval(opt_ctx, result);
