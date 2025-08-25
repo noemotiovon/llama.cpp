@@ -24,6 +24,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <iostream>
 
 const char * llm_type_name(llm_type type) {
     switch (type) {
@@ -8151,7 +8152,8 @@ struct llm_build_qwen2 : public llm_graph_context {
         ggml_tensor * cur;
         ggml_tensor * inpL;
 
-        inpL = build_inp_embd(model.tok_embd);
+        inpL = build_inp_embd(model.tok_embd); // FP32
+        std::cout << "lcg==>>inpL:" << inpL->type << std::endl;
 
         // inp_pos - contains the positions
         ggml_tensor * inp_pos = build_inp_pos();
@@ -8166,22 +8168,22 @@ struct llm_build_qwen2 : public llm_graph_context {
             // norm
             cur = build_norm(inpL,
                     model.layers[il].attn_norm, NULL,
-                    LLM_NORM_RMS, il);
+                    LLM_NORM_RMS, il); // FP32
             cb(cur, "attn_norm", il);
 
             // self-attention
             {
                 // compute Q and K and RoPE them
-                ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur);
-                Qcur = ggml_add(ctx0, Qcur, model.layers[il].bq);
+                ggml_tensor * Qcur = build_lora_mm(model.layers[il].wq, cur); // FP32
+                Qcur = ggml_add(ctx0, Qcur, model.layers[il].bq); //FP32
                 cb(Qcur, "Qcur", il);
 
-                ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur);
-                Kcur = ggml_add(ctx0, Kcur, model.layers[il].bk);
+                ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur); // FP32
+                Kcur = ggml_add(ctx0, Kcur, model.layers[il].bk); // FP32
                 cb(Kcur, "Kcur", il);
 
-                ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur);
-                Vcur = ggml_add(ctx0, Vcur, model.layers[il].bv);
+                ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur); // FP32
+                Vcur = ggml_add(ctx0, Vcur, model.layers[il].bv); // FP32
                 cb(Vcur, "Vcur", il);
 
                 Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
@@ -8192,13 +8194,13 @@ struct llm_build_qwen2 : public llm_graph_context {
                         ctx0, Qcur, inp_pos, nullptr,
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow
-                        );
+                        ); //FP32
 
                 Kcur = ggml_rope_ext(
                         ctx0, Kcur, inp_pos, nullptr,
                         n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                         ext_factor, attn_factor, beta_fast, beta_slow
-                        );
+                        ); //FP32
 
                 cb(Qcur, "Qcur", il);
                 cb(Kcur, "Kcur", il);
@@ -8206,7 +8208,7 @@ struct llm_build_qwen2 : public llm_graph_context {
 
                 cur = build_attn(inp_attn,
                         model.layers[il].wo, model.layers[il].bo,
-                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+                        Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il); //FP32
             }
 
             if (il == n_layer - 1 && inp_out_ids) {
@@ -8214,13 +8216,13 @@ struct llm_build_qwen2 : public llm_graph_context {
                 inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
             }
 
-            ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
+            ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA); //FP32
             cb(ffn_inp, "ffn_inp", il);
 
             // feed-forward network
             cur = build_norm(ffn_inp,
                     model.layers[il].ffn_norm, NULL,
-                    LLM_NORM_RMS, il);
+                    LLM_NORM_RMS, il); //FP32
             cb(cur, "ffn_norm", il);
 
             cur = build_ffn(cur,
@@ -8231,7 +8233,7 @@ struct llm_build_qwen2 : public llm_graph_context {
                     LLM_FFN_SILU, LLM_FFN_PAR, il);
             cb(cur, "ffn_out", il);
 
-            cur = ggml_add(ctx0, cur, ffn_inp);
+            cur = ggml_add(ctx0, cur, ffn_inp); //FP32
 
             cur = build_cvec(cur, il);
             cb(cur, "l_out", il);

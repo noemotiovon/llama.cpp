@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <iostream>
 
 //
 // llama_context
@@ -834,7 +835,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits != nullptr);
-
+        std::cout << "lcg==>>1"<< std::endl;
         ggml_backend_tensor_get_async(backend_res, t_logits, logits, 0, n_tokens*n_vocab*sizeof(float));
     }
 
@@ -850,6 +851,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
                     GGML_ASSERT(embd != nullptr);
 
                     GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_size);
+                    std::cout << "lcg==>>2"<< std::endl;
                     ggml_backend_tensor_get_async(backend_embd, t_embd, embd, 0, n_tokens*n_embd*sizeof(float));
                 } break;
             case LLAMA_POOLING_TYPE_MEAN:
@@ -864,6 +866,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
                         const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                         embd_seq_out[seq_id].resize(n_embd);
+                        std::cout << "lcg==>>3"<< std::endl;
                         ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd*seq_idx)*sizeof(float), n_embd*sizeof(float));
                     }
                 } break;
@@ -879,6 +882,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
                         const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                         embd_seq_out[seq_id].resize(n_cls_out);
+                        std::cout << "lcg==>>4"<< std::endl;
                         ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_cls_out*seq_idx)*sizeof(float), n_cls_out*sizeof(float));
                     }
                 } break;
@@ -1110,7 +1114,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits_size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                // std::cout << "lcg==>>5"<< std::endl;
+                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(uint16_t));
             }
         }
 
@@ -1129,6 +1134,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         if (n_outputs) {
                             GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                             GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd <= (int64_t) embd_size);
+                            std::cout << "lcg==>>6"<< std::endl;
                             ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd*sizeof(float));
                         }
                     } break;
@@ -1144,6 +1150,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                             embd_seq_out[seq_id].resize(n_embd);
+                            std::cout << "lcg==>>7"<< std::endl;
                             ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd*seq_idx)*sizeof(float), n_embd*sizeof(float));
                         }
                     } break;
@@ -1159,6 +1166,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                             embd_seq_out[seq_id].resize(n_cls_out);
+                            std::cout << "lcg==>>8"<< std::endl;
                             ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_cls_out*seq_idx)*sizeof(float), n_cls_out*sizeof(float));
                         }
                     } break;
