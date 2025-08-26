@@ -3184,49 +3184,35 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context& ctx, ggml_tensor* dst){
     ggml_tensor* src1 = dst->src[1]; // k, fp16
     ggml_tensor* src2 = dst->src[2]; // v, fp16
     ggml_tensor* src3 = dst->src[3]; // mask, fp16
+    //dst, fp32
 
-    std::cout << "src0 ne: [";
-    for (int i = 0; i < GGML_MAX_DIMS; i++) {
-        std::cout << src0->ne[i];
-        if (i != GGML_MAX_DIMS - 1) std::cout << " ";
-    }
-    std::cout << "]" << std::endl;
-
-    // 打印 nb
-    std::cout << "src0 nb: [";
-    for (int i = 0; i < GGML_MAX_DIMS; i++) {
-        std::cout << src0->nb[i];
-        if (i != GGML_MAX_DIMS - 1) std::cout << " ";
-    }
-    std::cout << "]" << std::endl;
-
-    std::cout << "dst ne: [";
-    for (int i = 0; i < GGML_MAX_DIMS; i++) {
-        std::cout << dst->ne[i];
-        if (i != GGML_MAX_DIMS - 1) std::cout << " ";
-    }
-    std::cout << "]" << std::endl;
-
-    // 打印 nb
-    std::cout << "dst nb: [";
-    for (int i = 0; i < GGML_MAX_DIMS; i++) {
-        std::cout << dst->nb[i];
-        if (i != GGML_MAX_DIMS - 1) std::cout << " ";
-    }
-    std::cout << "]" << std::endl;
-    // dst fp32
     auto transpose12 = [](ggml_tensor* t){
-            int64_t ne_tmp = t->ne[1];
-            size_t  nb_tmp = t->nb[1];
-            t->ne[1] = t->ne[2];
-            t->nb[1] = t->nb[2];
-            t->ne[2] = ne_tmp;
-            t->nb[2] = nb_tmp;
-        };
+        int64_t ne_tmp = t->ne[1];
+        size_t  nb_tmp = t->nb[1];
+        t->ne[1] = t->ne[2];
+        t->nb[1] = t->nb[2];
+        t->ne[2] = ne_tmp;
+        t->nb[2] = nb_tmp;
+    };
 
-    transpose12(src0);
-    transpose12(src1);
-    transpose12(src2);
+    // first prefill init n_heads
+    if(ctx.fa_n_heads == 0) {
+        ctx.fa_n_heads = src0->ne[2];
+    }
+
+    // prefill
+    if (src0->ne[1] != 1 && src0->ne[2] != 1) {
+        transpose12(src0);
+        transpose12(src1);
+        transpose12(src2);
+    } else {
+        // decode and src0->ne[2] == ctx.fa_n_heads, BNSD -> BSND
+        if (src0->ne[2] == ctx.fa_n_heads) {
+            transpose12(src0);
+            transpose12(src1);
+            transpose12(src2);
+        }
+    }
 
     float maxBias = 0.0f;
     float scaleValue = 1.0f;
@@ -3376,39 +3362,6 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context& ctx, ggml_tensor* dst){
         int64_t keyAntiquantMode = 0;
         int64_t valueAntiquantMode = 0;
 
-        // Step 4.5: 打印输入 tensor 信息
-        printf("==== FusedInferAttention Inputs ====\n");
-        printf("Q tensor (src0) ne: [");
-        for(int i=0;i<GGML_MAX_DIMS;i++) printf("%lld ", src0->ne[i]);
-        printf("]\n");
-
-        printf("K tensor (src1) ne: [");
-        for(int i=0;i<GGML_MAX_DIMS;i++) printf("%lld ", src1->ne[i]);
-        printf("]\n");
-
-        printf("V tensor (src2) ne: [");
-        for(int i=0;i<GGML_MAX_DIMS;i++) printf("%lld ", src2->ne[i]);
-        printf("]\n");
-
-        if(src3){
-            printf("Mask tensor (src3) ne: [");
-            for(int i=0;i<GGML_MAX_DIMS;i++) printf("%lld ", src3->ne[i]);
-            printf("]\n");
-
-            printf("Broadcasted mask tensor ne: [");
-            for(int i=0;i<GGML_MAX_DIMS;i++) printf("%lld ", bcast_pse_ne[i]);
-            printf("]\n");
-
-            printf("Broadcasted mask tensor nb: [");
-            for(int i=0;i<GGML_MAX_DIMS;i++) printf("%zu ", bcast_pse_nb[i]);
-            printf("]\n");
-        }
-
-        printf("numHeads = %lld, numKeyValueHeads = %lld\n", numHeads, numKeyValueHeads);
-        printf("layout = %c%c%c%c\n", layout[0], layout[1], layout[2], layout[3]);
-        printf("scaleValue = %f, maxBias = %f, logitSoftcap = %f\n", scaleValue, maxBias, logitSoftcap);
-        printf("===================================\n");
-
         // Step 5: launch the FusedInferAttentionScoreV2 kernel.
         // Refer to https://gitee.com/ascend/cann-ops-adv/blob/master/docs/FusedInferAttentionScoreV2.md
 
@@ -3437,16 +3390,10 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context& ctx, ggml_tensor* dst){
         );
 
         // Step 6: post-processing, permute and cast to f32
-
         aclTensor* acl_dst_tensor = ggml_cann_create_tensor(dst);
-
-        if(ggml_cann_type_mapping(dst->type) != faDataType){
-            aclnn_cast(ctx,
+        // TODO direct use acl_dst_tensor in FusedInferAttentionScoreV2 when output is fp32
+        aclnn_cast(ctx,
                 acl_dst_f16_tensor, acl_dst_tensor, ggml_cann_type_mapping(dst->type));
-        }else{
-            // only need to permute
-            // aclnn_permute(ctx, acl_dst_f16_tensor, acl_dst_tensor, new_dim, GGML_MAX_DIMS);
-        }
         ggml_cann_release_resources(ctx, acl_src0_f16_tensor,
                                          acl_src1_f16_tensor,
                                          acl_src2_f16_tensor,

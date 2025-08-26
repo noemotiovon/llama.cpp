@@ -385,6 +385,7 @@ struct ggml_backend_cann_context {
     void* f32_one_cache = nullptr;
     int64_t f32_zero_cache_element = 0;
     int64_t f32_one_cache_element = 0;
+    int64_t fa_n_heads = 0;
 
     aclrtStream streams[GGML_CANN_MAX_STREAMS] = {nullptr}; /**< Array of streams for the device. */
 
