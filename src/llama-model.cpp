@@ -8399,6 +8399,7 @@ struct llm_build_qwen2 : public llm_graph_context {
         ggml_tensor * inpL;
 
         inpL = build_inp_embd(model.tok_embd);
+        inpL = ggml_cast(ctx0, inpL, GGML_TYPE_F16);
 
         // inp_pos - contains the positions
         ggml_tensor * inp_pos = build_inp_pos();
@@ -8454,20 +8455,24 @@ struct llm_build_qwen2 : public llm_graph_context {
                 cur = build_attn(inp_attn,
                         model.layers[il].wo, model.layers[il].bo,
                         Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
+
             }
 
             if (il == n_layer - 1 && inp_out_ids) {
                 cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
                 inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+                cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+                inpSA = ggml_cast(ctx0, inpSA, GGML_TYPE_F16);
             }
 
             ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
-            cb(ffn_inp, "ffn_inp", il);
 
+            cb(ffn_inp, "ffn_inp", il);
             // feed-forward network
             cur = build_norm(ffn_inp,
                     model.layers[il].ffn_norm, NULL,
                     LLM_NORM_RMS, il);
+
             cb(cur, "ffn_norm", il);
 
             cur = build_ffn(cur,
@@ -8488,7 +8493,6 @@ struct llm_build_qwen2 : public llm_graph_context {
         }
 
         cur = inpL;
-
         cur = build_norm(cur,
                 model.output_norm, NULL,
                 LLM_NORM_RMS, -1);
@@ -8498,6 +8502,7 @@ struct llm_build_qwen2 : public llm_graph_context {
 
         // lm_head
         cur = build_lora_mm(model.output, cur);
+        cur = ggml_cast(ctx0 ,cur, GGML_TYPE_F32);
 
         if (model.output_b != nullptr) {
             cur = ggml_add(ctx0, cur, model.output_b);

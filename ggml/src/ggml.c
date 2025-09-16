@@ -3024,7 +3024,7 @@ struct ggml_tensor * ggml_mul_mat(
     GGML_ASSERT(!ggml_is_transposed(a));
 
     const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, b->type, 4, ne);
 
     result->op     = GGML_OP_MUL_MAT;
     result->src[0] = a;
@@ -3676,7 +3676,7 @@ struct ggml_tensor * ggml_set_rows(
     GGML_ASSERT(b->ne[2] % c->ne[1] == 0);
     GGML_ASSERT(b->ne[3] % c->ne[2] == 0);
     GGML_ASSERT(c->ne[3] == 1);
-    GGML_ASSERT(b->type == GGML_TYPE_F32);
+    // GGML_ASSERT(b->type == GGML_TYPE_F32);
     GGML_ASSERT(c->type == GGML_TYPE_I64);
 
     GGML_ASSERT(ggml_is_contiguous_rows(a));
@@ -5007,7 +5007,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
 
     // permute(0, 2, 1, 3)
     int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, q->type, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };
     ggml_set_op_params(result, params, sizeof(params));
