@@ -497,6 +497,7 @@ extern "C" {
         GGML_OP_VIEW,
         GGML_OP_PERMUTE,
         GGML_OP_TRANSPOSE,
+        GGML_OP_GET_ROWS_CPU,
         GGML_OP_GET_ROWS,
         GGML_OP_GET_ROWS_BACK,
         GGML_OP_SET_ROWS,
@@ -1535,6 +1536,11 @@ extern "C" {
     //
     // return [n_embd, n_rows, ne2, ne3]
     GGML_API struct ggml_tensor * ggml_get_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // data
+            struct ggml_tensor  * b); // row indices
+
+    GGML_API struct ggml_tensor * ggml_get_rows_cpu(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices

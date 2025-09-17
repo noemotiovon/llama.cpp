@@ -8397,7 +8397,7 @@ struct llm_build_qwen2 : public llm_graph_context {
 
         ggml_tensor * cur;
         ggml_tensor * inpL;
-
+        
         inpL = build_inp_embd(model.tok_embd);
         inpL = ggml_cast(ctx0, inpL, GGML_TYPE_F16);
 
