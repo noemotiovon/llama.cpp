@@ -1881,6 +1881,9 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context& ctx,
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cann_flash_attn_ext(ctx, dst);
             break;
+        case GGML_OP_GATED_LINEAR_ATTN:
+            ggml_cann_gated_linear_attn(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -2493,6 +2496,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev,
         case GGML_OP_MEAN:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_COUNT_EQUAL:
+        case GGML_OP_GATED_LINEAR_ATTN:
             return true;
         case GGML_OP_SCALE:
             float bias;
