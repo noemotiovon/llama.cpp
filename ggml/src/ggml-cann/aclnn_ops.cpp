@@ -3425,4 +3425,49 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context& ctx, ggml_tensor* dst){
     }
 }
 
-void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {}
+void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    (void) ctx;
+
+    ggml_tensor * src0 = dst->src[0];
+    ggml_tensor * src1 = dst->src[1];
+
+    int64_t d_inner = dst->ne[0];
+    int64_t nt      = dst->ne[1];
+    int64_t ns      = dst->ne[2];
+    int64_t d_conv  = src1->ne[0];
+    int64_t nc      = src0->ne[0];
+
+    GGML_ASSERT(nc == d_conv - 1 + nt);
+    GGML_ASSERT(src0->ne[1] == d_inner);
+    GGML_ASSERT(src0->ne[2] == ns);
+    GGML_ASSERT(src0->ne[3] == 1);
+
+    GGML_ASSERT(src1->ne[1] == d_inner);
+    GGML_ASSERT(src1->ne[2] == 1);
+    GGML_ASSERT(src1->ne[3] == 1);
+
+    GGML_ASSERT(dst->ne[3] == 1);
+
+    std::vector<float> local_src0(ggml_nbytes(src0) / sizeof(float));
+    aclrtMemcpy(local_src0.data(), ggml_nbytes(src0), src0->data, ggml_nbytes(src0), ACL_MEMCPY_DEVICE_TO_HOST);
+    std::vector<float> local_src1(ggml_nbytes(src1) / sizeof(float));
+    aclrtMemcpy(local_src1.data(), ggml_nbytes(src1), src1->data, ggml_nbytes(src1), ACL_MEMCPY_DEVICE_TO_HOST);
+    std::vector<float> local_dst(ggml_nbytes(dst) / sizeof(float));
+
+    for (int64_t i = 0; i < d_inner; i++) {
+        for (int64_t j = 0; j < nt; j++) {
+            for (int64_t k = 0; k < ns; k++) {
+                float sum = 0;
+                for (int64_t l = 0; l < d_conv; l++) {
+                    int64_t idx0 = (j + l) + i * (d_conv - 1 + nt) + k * (d_conv - 1 + nt) * d_inner;
+                    int64_t idx1 = l + i * d_conv;
+                    sum += local_src0[idx0] * local_src1[idx1];
+                }
+                int64_t idx    = i + j * d_inner + k * nt * d_inner;
+                local_dst[idx] = sum;
+            }
+        }
+    }
+
+    aclrtMemcpy(dst->data, ggml_nbytes(dst), local_dst.data(), ggml_nbytes(dst), ACL_MEMCPY_HOST_TO_DEVICE);
+}
