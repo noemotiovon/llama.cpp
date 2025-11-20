@@ -1142,6 +1142,8 @@ void ggml_cann_op_unary(
     std::function<void(ggml_backend_cann_context&, aclTensor*, aclTensor*)> unary_op,
     ggml_backend_cann_context& ctx, ggml_tensor* dst);
 
+void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+
 /**
  * @brief Applies a gated (GLU-style) unary operation using the CANN backend.
  *
