@@ -423,6 +423,98 @@ void ggml_cann_argsort(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     ggml_cann_release_resources(ctx, acl_src, tmp_tensor, acl_dst);
 }
 
+void ggml_cann_l2_norm(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
+    ggml_tensor* src = dst->src[0];
+    GGML_ASSERT(src && dst);
+    GGML_ASSERT(src->type == GGML_TYPE_F32); // input f32
+    GGML_ASSERT(dst->type == GGML_TYPE_F32); // output f32
+
+    // Step 0: read eps from op_params, use double for more precision
+    double eps = 1e-6;
+    memcpy(&eps, dst->op_params, sizeof(double));  //  double  eps
+
+    // Step 1: create acl tensors for src/dst
+    aclTensor* acl_src = ggml_cann_create_tensor(src);
+    aclTensor* acl_dst = ggml_cann_create_tensor(dst);
+
+    // Step 2: allocate temporary buffer: need 4 * src_bytes
+    size_t type_size = ggml_type_size(src->type);
+    size_t src_bytes = ggml_nbytes(src);
+    ggml_cann_pool_alloc tmp_alloc(ctx.pool(), src_bytes * 4);
+    void* buf = tmp_alloc.get();
+
+    // Step 3: sq = x * x  (same shape as src)
+    int64_t ne_tmp[GGML_MAX_DIMS];
+    size_t nb_tmp[GGML_MAX_DIMS];
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        ne_tmp[i] = src->ne[i];
+        nb_tmp[i] = src->nb[i];
+    }
+    aclTensor* acl_sq = ggml_cann_create_tensor(
+        buf, ACL_FLOAT, type_size, ne_tmp, nb_tmp, GGML_MAX_DIMS, ACL_FORMAT_ND);
+    GGML_CANN_CALL_ACLNN_OP(ctx, Mul, acl_src, acl_src, acl_sq);
+
+    // Step 4: reduce sum over ggml axis 0 (innermost dim) -> map to ACL axis
+    const int ggml_reduce_axis = 0;
+    const int64_t acl_reduce_axis = ggml_n_dims(src) - 1 - ggml_reduce_axis;
+    int64_t reduce_dims[] = { acl_reduce_axis };
+    aclIntArray* reduce_axis = aclCreateIntArray(reduce_dims, 1);
+
+    // Build ne_sum: set reduced ggml axis to 1
+    int64_t ne_sum[GGML_MAX_DIMS];
+    for (int i = 0; i < GGML_MAX_DIMS; i++) ne_sum[i] = src->ne[i];
+    ne_sum[ggml_reduce_axis] = 1;
+
+    // nb for ne_sum
+    size_t nb_sum[GGML_MAX_DIMS];
+    nb_sum[0] = ggml_type_size(src->type);
+    for (int i = 1; i < GGML_MAX_DIMS; i++) nb_sum[i] = nb_sum[i - 1] * ne_sum[i - 1];
+
+    // Create acl_sum with ne_sum layout (explicit ACL_FLOAT)
+    aclTensor* acl_sum = ggml_cann_create_tensor(
+        (char*)buf + src_bytes, ACL_FLOAT, type_size, ne_sum, nb_sum, GGML_MAX_DIMS, ACL_FORMAT_ND);
+
+    // IMPORTANT CHANGE: explicitly request REDUCE output type = ACL_FLOAT to force float accumulation/output
+    GGML_CANN_CALL_ACLNN_OP(ctx, ReduceSum, acl_sq, reduce_axis, true,
+                            ACL_FLOAT, acl_sum);
+
+    // Step 5: adds eps and sqrt, use double for higher precision
+    double eps_dbl = eps;  // Use double to store eps for higher precision
+    aclScalar* eps_scalar = aclCreateScalar(&eps_dbl, ACL_FLOAT);  // Explicitly create as float
+    double one_dbl = 1.0;
+    aclScalar* alpha_scalar = aclCreateScalar(&one_dbl, ACL_FLOAT);
+
+    // Add eps: acl_sum = acl_sum + eps
+    GGML_CANN_CALL_ACLNN_OP(ctx, Adds, acl_sum, eps_scalar, alpha_scalar, acl_sum);
+
+    // sqrt (use double precision for sqrt to avoid precision loss)
+    aclTensor* acl_sqrt = ggml_cann_create_tensor(
+        (char*)buf + src_bytes * 2, ACL_FLOAT, type_size, ne_sum, nb_sum, GGML_MAX_DIMS, ACL_FORMAT_ND);
+    GGML_CANN_CALL_ACLNN_OP(ctx, Sqrt, acl_sum, acl_sqrt);
+
+    // Step 6: repeat sqrt back to src shape -> create target tensor for expanded sqrt
+    int64_t repeats[GGML_MAX_DIMS];
+    repeats[0] = (ne_sum[3] == 0) ? 1 : (src->ne[3] / ne_sum[3]);
+    repeats[1] = (ne_sum[2] == 0) ? 1 : (src->ne[2] / ne_sum[2]);
+    repeats[2] = (ne_sum[1] == 0) ? 1 : (src->ne[1] / ne_sum[1]);
+    repeats[3] = (ne_sum[0] == 0) ? 1 : (src->ne[0] / ne_sum[0]);
+
+    // allocate target expanded tensor (same shape as src)
+    aclTensor* acl_sqrt_rep = ggml_cann_create_tensor(
+        (char*)buf + src_bytes * 3, ACL_FLOAT, type_size, src->ne, src->nb, GGML_MAX_DIMS, ACL_FORMAT_ND);
+
+    // perform repeat: small -> expanded
+    aclnn_repeat(ctx, acl_sqrt, acl_sqrt_rep, repeats);
+
+    // Step 7: divide x / sqrt_sum_expanded
+    GGML_CANN_CALL_ACLNN_OP(ctx, Div, acl_src, acl_sqrt_rep, acl_dst);
+
+    // Step 8: release
+    ggml_cann_release_resources(ctx,
+        reduce_axis, eps_scalar, alpha_scalar,
+        acl_src, acl_sq, acl_sum, acl_sqrt, acl_sqrt_rep, acl_dst);
+}
+
 void ggml_cann_norm(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
     ggml_tensor* src = dst->src[0];
 

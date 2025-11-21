@@ -185,6 +185,8 @@ void ggml_cann_argsort(ggml_backend_cann_context& ctx, ggml_tensor* dst);
  * @param dst The destination tensor where the normalized values will be stored.
  * @attention `Var` defaults to dst->ne[0].
  */
+void ggml_cann_l2_norm(ggml_backend_cann_context& ctx, ggml_tensor* dst);
+
 void ggml_cann_norm(ggml_backend_cann_context& ctx, ggml_tensor* dst);
 
 /**

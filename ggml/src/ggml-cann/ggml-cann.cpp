@@ -1771,6 +1771,10 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context& ctx,
                     return false;
             }
             break;
+
+        case GGML_OP_L2_NORM:
+            ggml_cann_l2_norm(ctx, dst);
+            break;
         case GGML_OP_NORM:
             ggml_cann_norm(ctx, dst);
             break;
@@ -2466,6 +2470,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev,
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
+        case GGML_OP_L2_NORM:
         case GGML_OP_NORM:
         case GGML_OP_ADD:
         case GGML_OP_ADD1:
