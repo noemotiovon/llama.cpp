@@ -3439,9 +3439,8 @@ void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     int64_t nt      = dst->ne[1];
     int64_t ns      = dst->ne[2];
     int64_t d_conv  = src1->ne[0];
-    int64_t nc      = src0->ne[0];
 
-    GGML_ASSERT(nc == d_conv - 1 + nt);
+    GGML_ASSERT(src0->ne[0] == d_conv - 1 + nt);
     GGML_ASSERT(src0->ne[1] == d_inner);
     GGML_ASSERT(src0->ne[2] == ns);
     GGML_ASSERT(src0->ne[3] == 1);
@@ -3451,62 +3450,102 @@ void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src1->ne[3] == 1);
 
     GGML_ASSERT(dst->ne[3] == 1);
-    std::cout << "d_inner=" << d_inner << ", nt=" << nt << ", ns=" << ns << ", d_conv=" << d_conv << ", nc=" << nc
-              << "\n";
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
 
-    // we have
-    // dst:  [d_inner, nt, ns, 1]
-    // src0: [d_conv-1+nt, d_inner, ns, 1]
-    // src1: [d_conv, d_inner, 1, 1]
-    // compute:
-    // dst[i,j,k] = \sum_l=0^{d_conv-1} src0[j+l, i, k] src1[l, i]
-    // 1d convolution:
-    // Y[i] = \sum_j=0^{n-1} X[i+j] w[j]
-    //
-    // out[N_i, C_out_j] = weight[C_out_j, C_in_j] \star self[N_i, C_in_j]
+    int64_t     x_ne[3] = { d_conv - 1 + nt, d_inner, ns };
+    size_t      x_nb[3] = { 1 * sizeof(float),
+                            (d_conv - 1 + nt) * sizeof(float),
+                            (d_conv - 1 + nt) * d_inner * sizeof(float) };
+    aclTensor * X       = ggml_cann_create_tensor(src0, x_ne, x_nb, 3, ACL_FORMAT_NCL);
+    int64_t     w_ne[3] = { d_conv, d_inner, d_inner };
+    size_t      w_nb[3] = { 1 * sizeof(float), d_conv * sizeof(float), d_conv * d_inner * sizeof(float) };
+    uint8_t *   w_data  = nullptr;
+    aclrtMalloc((void **) &w_data, d_inner * d_inner * d_conv * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST);
 
-    int64_t x_ne[4] = { d_conv - 1 + nt, ns, 1, d_inner };
-    size_t  x_nb[4] = {
-        1 * sizeof(float),
-        (d_conv - 1 + nt) * d_inner * sizeof(float),
-        (d_conv - 1 + nt) * d_inner * ns * sizeof(float),
-        (d_conv - 1 + nt) * sizeof(float),
-    };
-    aclTensor * X       = ggml_cann_create_tensor(src0, x_ne, x_nb, 4, ACL_FORMAT_NCHW);
-    int64_t     w_ne[4] = { d_conv, 1, 1, d_inner };
-    size_t      w_nb[4] = {
-        1 * sizeof(float),
-        d_conv * d_inner * sizeof(float),
-        d_conv * d_inner * sizeof(float),
-        d_conv * sizeof(float),
-    };
-    aclTensor * W       = ggml_cann_create_tensor(src1, w_ne, w_nb, 4, ACL_FORMAT_NCHW);
-    int64_t     y_ne[4] = { nt, ns, 1, d_inner };
-    size_t      y_nb[4] = {
-        d_inner * sizeof(float),
-        d_inner * nt * sizeof(float),
-        d_inner * ns * nt * sizeof(float),
-        1 * sizeof(float),
-    };
-    aclTensor * Y = ggml_cann_create_tensor(dst, y_ne, y_nb, 4, ACL_FORMAT_NCHW);
+    std::vector<float> w_local(d_inner * d_conv);
+    std::vector<float> w1_local(d_inner * d_inner * d_conv, 0);
+    aclrtMemcpy(
+        w_local.data(), w_local.size() * sizeof(float), src1->data, ggml_nbytes(src1), ACL_MEMCPY_DEVICE_TO_HOST);
+    for (int j = 0; j < d_inner; j++) {
+        for (int l = 0; l < d_conv; l++) {
+            int idx1       = l + d_conv * j;
+            int idx2       = l + d_conv * j + d_conv * d_inner * j;
+            w1_local[idx2] = w_local[idx1];
+        }
+    }
+    aclrtMemcpy(w_data,
+                w1_local.size() * sizeof(float),
+                w1_local.data(),
+                w1_local.size() * sizeof(float),
+                ACL_MEMCPY_HOST_TO_DEVICE);
 
-    int64_t       strideVal[]     = { 1, 1 };
-    aclIntArray * stride          = aclCreateIntArray(strideVal, 2);
-    int64_t       paddingVal[]    = { 0, 0 };
-    aclIntArray * padding         = aclCreateIntArray(paddingVal, 2);
-    int64_t       dilationVal[]   = { 1, 1 };
-    aclIntArray * dilation        = aclCreateIntArray(dilationVal, 2);
-    int64_t       kernelSizeVal[] = { 1, d_conv };
-    aclIntArray * kernelSize      = aclCreateIntArray(kernelSizeVal, 2);
-    int8_t        cubeMathType    = 0;
+    aclTensor * W       = ggml_cann_create_tensor(w_data, ACL_FLOAT, sizeof(float), w_ne, w_nb, 3, ACL_FORMAT_NCL);
+    int64_t     y_ne[3] = { nt, d_inner, ns };
+    size_t      y_nb[3] = { d_inner * sizeof(float), 1 * sizeof(float), d_inner * nt * sizeof(float) };
+    aclTensor * Y       = ggml_cann_create_tensor(dst, y_ne, y_nb, 3, ACL_FORMAT_NCL);
 
+    int64_t       stride_data[1]   = { 1 };
+    aclIntArray * stride           = aclCreateIntArray(stride_data, 1);
+    int64_t       padding_data[1]  = { 0 };
+    aclIntArray * padding          = aclCreateIntArray(padding_data, 1);
+    int64_t       dilation_data[1] = { 1 };
+    aclIntArray * dilation         = aclCreateIntArray(dilation_data, 1);
+    bool          transposed       = false;
+    int64_t       groups           = 1;
+    int8_t        cubeMathType     = 0;
 #ifdef ASCEND_310P
     cubeMathType = 1;
 #endif
-
-    //const aclTensor *self, const aclTensor *weight, const aclIntArray *kernelSize, const aclTensor *bias, const aclIntArray *stride, const aclIntArray *padding, const aclIntArray *dilation, aclTensor *out, int8_t cubeMathType, uint64_t *workspaceSize,
     GGML_CANN_CALL_ACLNN_OP(
-        ctx, ConvDepthwise2d, X, W, kernelSize, nullptr, stride, padding, dilation, Y, cubeMathType);
+        ctx, Convolution, X, W, nullptr, stride, padding, dilation, transposed, padding, groups, Y, cubeMathType);
 
-    ggml_cann_release_resources(ctx, X, W, stride, padding, dilation);
+    std::vector<float> y_local(y_ne[0] * y_ne[1] * y_ne[2]);
+    std::vector<float> x_local(x_ne[0] * x_ne[1] * x_ne[2]);
+    aclrtMemcpy(
+        x_local.data(), x_local.size() * sizeof(float), src0->data, ggml_nbytes(src0), ACL_MEMCPY_DEVICE_TO_HOST);
+
+    for (int i = 0; i < ns; i++) {
+        for (int j = 0; j < d_inner; j++) {
+            for (int k = 0; k < nt; k++) {
+                float sum = 0.0;
+                for (int m = 0; m < d_inner; m++) {
+                    for (int l = 0; l < d_conv; l++) {
+                        int idx1 = (j * w_nb[2] + m * w_nb[1] + l * w_nb[0]) / sizeof(float);
+                        GGML_ASSERT(j < w_ne[2]);
+                        GGML_ASSERT(m < w_ne[1]);
+                        GGML_ASSERT(l < w_ne[0]);
+                        GGML_ASSERT(idx1 < w1_local.size());
+                        int idx2 = (i * x_nb[2] + m * x_nb[1] + (k + l) * x_nb[0]) / sizeof(float);
+                        GGML_ASSERT(i < x_ne[2]);
+                        GGML_ASSERT(m < x_ne[1]);
+                        GGML_ASSERT(k + l < x_ne[0]);
+                        GGML_ASSERT(idx2 < x_local.size());
+                        sum += w1_local[idx1] * x_local[idx2];
+                    }
+                }
+                int idx3 = (i * y_nb[2] + j * y_nb[1] + k * y_nb[0]) / sizeof(float);
+                GGML_ASSERT(i < y_ne[2]);
+                GGML_ASSERT(j < y_ne[1]);
+                GGML_ASSERT(k < y_ne[0]);
+                GGML_ASSERT(idx3 < y_local.size());
+                y_local[idx3] = sum;
+            }
+        }
+    }
+
+    std::vector<float> y_got(y_ne[0] * y_ne[1] * y_ne[2]);
+    aclrtMemcpy(y_got.data(), y_got.size() * sizeof(float), dst->data, ggml_nbytes(dst), ACL_MEMCPY_DEVICE_TO_HOST);
+
+#define min(a, b) ((a) > (b) ? (b) : (a))
+    for (int i = 0; i < min(y_got.size(), 10); i++) {
+        std::cout << y_local[i] << " ";
+    }
+    std::cout << "\n";
+    for (int i = 0; i < min(y_got.size(), 10); i++) {
+        std::cout << y_got[i] << " ";
+    }
+    std::cout << "\n";
+#undef min
 }
