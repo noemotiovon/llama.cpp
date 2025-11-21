@@ -22,6 +22,7 @@
 
 #include "aclnn_ops.h"
 
+#include "aclnnop/aclnn_eye.h"
 #include "ggml-cann/acl_tensor.h"
 #include "ggml-impl.h"
 #include "ggml.h"
@@ -3463,25 +3464,33 @@ void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
     size_t      w_nb[3] = { 1 * sizeof(float), d_conv * sizeof(float), d_conv * d_inner * sizeof(float) };
     uint8_t *   w_data  = nullptr;
     aclrtMalloc((void **) &w_data, d_inner * d_inner * d_conv * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST);
+    aclTensor * W1 = ggml_cann_create_tensor(
+        w_data, ACL_FLOAT, sizeof(float), w_ne, w_nb, 3, ACL_FORMAT_NCL);                   // [d_conv,d_inner,d_inner]
+    aclTensor *   W = ggml_cann_create_tensor(src1, src1->ne, src1->nb, 2, ACL_FORMAT_NC);  // [d_conv, d_inner]
+    int64_t       repeats_data[3] = { d_inner, 1, 1 };
+    aclIntArray * repeats         = aclCreateIntArray(repeats_data, 3);
 
-    std::vector<float> w_local(d_inner * d_conv);
-    std::vector<float> w1_local(d_inner * d_inner * d_conv, 0);
-    aclrtMemcpy(
-        w_local.data(), w_local.size() * sizeof(float), src1->data, ggml_nbytes(src1), ACL_MEMCPY_DEVICE_TO_HOST);
-    for (int j = 0; j < d_inner; j++) {
-        for (int l = 0; l < d_conv; l++) {
-            int idx1       = l + d_conv * j;
-            int idx2       = l + d_conv * j + d_conv * d_inner * j;
-            w1_local[idx2] = w_local[idx1];
-        }
-    }
-    aclrtMemcpy(w_data,
-                w1_local.size() * sizeof(float),
-                w1_local.data(),
-                w1_local.size() * sizeof(float),
-                ACL_MEMCPY_HOST_TO_DEVICE);
+    uint8_t * eye_data = nullptr;
+    aclrtMalloc((void **) &eye_data, d_inner * d_inner * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST);
+    int64_t     eye_ne[2] = { d_inner, d_inner };
+    size_t      eye_nb[2] = { 1 * sizeof(float), d_inner * sizeof(float) };
+    aclTensor * eye = ggml_cann_create_tensor(eye_data, ACL_FLOAT, sizeof(float), eye_ne, eye_nb, 2, ACL_FORMAT_ND);
+    uint8_t *   eye_3d_data = nullptr;
+    aclrtMalloc((void **) &eye_3d_data, d_inner * d_inner * d_conv * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST);
+    int64_t     eye_3d_ne[3] = { d_inner, d_inner, d_conv };
+    size_t      eye_3d_nb[3] = { 1 * sizeof(float), d_inner * sizeof(float), d_inner * d_inner * sizeof(float) };
+    aclTensor * eye_3d =
+        ggml_cann_create_tensor(eye_3d_data, ACL_FLOAT, sizeof(float), eye_3d_ne, eye_3d_nb, 3, ACL_FORMAT_NCL);
 
-    aclTensor * W       = ggml_cann_create_tensor(w_data, ACL_FLOAT, sizeof(float), w_ne, w_nb, 3, ACL_FORMAT_NCL);
+    uint8_t * mask_data = nullptr;
+    aclrtMalloc((void **) &mask_data, d_inner * d_inner * d_conv * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST);
+    aclTensor * mask = ggml_cann_create_tensor(
+        mask_data, ACL_FLOAT, sizeof(float), w_ne, w_nb, 3, ACL_FORMAT_NCL);  // [d_conv,d_inner,d_inner]
+    int64_t       eye_repeats_data[3] = { d_conv, 1, 1 };
+    aclIntArray * eye_repeats         = aclCreateIntArray(eye_repeats_data, 3);
+    int64_t       eye_permute[3]      = { 1, 2, 0 };
+    aclIntArray * permute             = aclCreateIntArray(eye_permute, 3);
+
     int64_t     y_ne[3] = { nt, d_inner, ns };
     size_t      y_nb[3] = { d_inner * sizeof(float), 1 * sizeof(float), d_inner * nt * sizeof(float) };
     aclTensor * Y       = ggml_cann_create_tensor(dst, y_ne, y_nb, 3, ACL_FORMAT_NCL);
@@ -3498,13 +3507,26 @@ void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 #ifdef ASCEND_310P
     cubeMathType = 1;
 #endif
-    GGML_CANN_CALL_ACLNN_OP(
-        ctx, Convolution, X, W, nullptr, stride, padding, dilation, transposed, padding, groups, Y, cubeMathType);
 
+    GGML_CANN_CALL_ACLNN_OP(ctx, Repeat, W, repeats, W1);
+    GGML_CANN_CALL_ACLNN_OP(ctx, Eye, d_inner, d_inner, eye);
+    GGML_CANN_CALL_ACLNN_OP(ctx, Repeat, eye, eye_repeats, eye_3d);
+    GGML_CANN_CALL_ACLNN_OP(ctx, Permute, eye_3d, permute, mask);
+    GGML_CANN_CALL_ACLNN_OP(ctx, InplaceMul, W1, mask);
+    GGML_CANN_CALL_ACLNN_OP(
+        ctx, Convolution, X, W1, nullptr, stride, padding, dilation, transposed, padding, groups, Y, cubeMathType);
+
+#ifdef GGML_CANN_SSM_CONV_CHECK
     std::vector<float> y_local(y_ne[0] * y_ne[1] * y_ne[2]);
     std::vector<float> x_local(x_ne[0] * x_ne[1] * x_ne[2]);
+    std::vector<float> w_local(w_ne[0] * w_ne[1] * w_ne[2]);
     aclrtMemcpy(
         x_local.data(), x_local.size() * sizeof(float), src0->data, ggml_nbytes(src0), ACL_MEMCPY_DEVICE_TO_HOST);
+    aclrtMemcpy(w_local.data(),
+                w_local.size() * sizeof(float),
+                w_data,
+                w_local.size() * sizeof(float),
+                ACL_MEMCPY_DEVICE_TO_HOST);
 
     for (int i = 0; i < ns; i++) {
         for (int j = 0; j < d_inner; j++) {
@@ -3516,13 +3538,13 @@ void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
                         GGML_ASSERT(j < w_ne[2]);
                         GGML_ASSERT(m < w_ne[1]);
                         GGML_ASSERT(l < w_ne[0]);
-                        GGML_ASSERT(idx1 < w1_local.size());
+                        GGML_ASSERT(idx1 < w_local.size());
                         int idx2 = (i * x_nb[2] + m * x_nb[1] + (k + l) * x_nb[0]) / sizeof(float);
                         GGML_ASSERT(i < x_ne[2]);
                         GGML_ASSERT(m < x_ne[1]);
                         GGML_ASSERT(k + l < x_ne[0]);
                         GGML_ASSERT(idx2 < x_local.size());
-                        sum += w1_local[idx1] * x_local[idx2];
+                        sum += w_local[idx1] * x_local[idx2];
                     }
                 }
                 int idx3 = (i * y_nb[2] + j * y_nb[1] + k * y_nb[0]) / sizeof(float);
@@ -3537,8 +3559,9 @@ void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
 
     std::vector<float> y_got(y_ne[0] * y_ne[1] * y_ne[2]);
     aclrtMemcpy(y_got.data(), y_got.size() * sizeof(float), dst->data, ggml_nbytes(dst), ACL_MEMCPY_DEVICE_TO_HOST);
+    aclrtMemcpy(dst->data, y_got.size() * sizeof(float), y_local.data(), ggml_nbytes(dst), ACL_MEMCPY_DEVICE_TO_HOST);
 
-#define min(a, b) ((a) > (b) ? (b) : (a))
+#    define min(a, b) ((a) > (b) ? (b) : (a))
     for (int i = 0; i < min(y_got.size(), 10); i++) {
         std::cout << y_local[i] << " ";
     }
@@ -3547,5 +3570,9 @@ void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
         std::cout << y_got[i] << " ";
     }
     std::cout << "\n";
-#undef min
+#    undef min
+#endif
+
+    ggml_cann_release_resources(
+        ctx, W, repeats, W1, eye, eye_repeats, eye_3d, permute, mask, X, stride, padding, dilation, Y);
 }
