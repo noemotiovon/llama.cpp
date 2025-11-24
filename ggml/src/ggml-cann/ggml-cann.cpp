@@ -2324,10 +2324,11 @@ static enum ggml_status ggml_backend_cann_graph_compute(
     ggml_backend_cann_context* cann_ctx =
         (ggml_backend_cann_context*)backend->context;
     ggml_cann_set_device(cann_ctx->device);
-    release_nz_workspace();
-#ifdef USE_ACL_GRAPH
-    bool use_cann_graph = true;
+    g_nz_workspaces[cann_ctx->device].clear();
+
     bool cann_graph_update_required = false;
+#ifdef USE_ACL_GRAPH
+    bool use_cann_graph             = true;
 
     // check environment LLAMA_SET_ROWS
     if (!cann_ctx->support_set_rows) {
@@ -2344,7 +2345,6 @@ static enum ggml_status ggml_backend_cann_graph_compute(
     }
 #else
     bool use_cann_graph = false;
-    bool cann_graph_update_required = false;
 #endif  // USE_ACL_GRAPH
     evaluate_and_capture_cann_graph(
         cann_ctx,
