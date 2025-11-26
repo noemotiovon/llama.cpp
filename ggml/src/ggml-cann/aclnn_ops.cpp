@@ -441,90 +441,112 @@ void ggml_cann_norm(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
 }
 
 void ggml_cann_gated_linear_attn(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
+    // 获取输入张量
     ggml_tensor * k  = dst->src[0];
     ggml_tensor * v  = dst->src[1];
     ggml_tensor * q  = dst->src[2];
     ggml_tensor * g = dst->src[3];
     ggml_tensor * s  = dst->src[4];
 
-    int64_t B = dst->src[4]->ne[1];
-    int64_t T = dst->src[0]->ne[2];
-    int64_t H = dst->src[0]->ne[1];
-    int64_t C = dst->ne[0];
-    int64_t D = C / H;
-    int64_t L = T / B;
+    // 计算维度参数
+    int64_t B = dst->src[4]->ne[1]; // Batch size
+    int64_t T = dst->src[0]->ne[2]; // Total sequence length
+    int64_t H = dst->src[0]->ne[1]; // Number of heads
+    int64_t C = dst->ne[0];         // Total channels
+    int64_t D = C / H;              // Dimensionality per head
+    int64_t L = T / B;              // Sequence length per batch
 
-    int64_t ne_qkg[2] = {1, D};
-    // int64_t ne_qkg[2] = {D, 1};
-    int64_t ne_s[2] = {D, D};
-    int64_t ne_vo[2] = {D, 1};
-    // int64_t ne_vo[2] = {1, D};
-    int64_t ne_q[1] = {D};
+    // 设置张量维度和步长信息
+    int64_t ne_qkg[2] = {1, D};     // k/g的形状 [1,D]
+    int64_t ne_s[2] = {D, D};       // 状态张量形状 [D,D]
+    int64_t ne_vo[2] = {D, 1};      // v的形状 [D,1]
+    int64_t ne_q[1] = {D};          // q/o的形状 [D]
+    
+    // 计算步长（内存布局）
     size_t nb_base = ggml_type_size(k->type);
     size_t nb_qkg[2] = {nb_base, nb_base};
     size_t nb_s[2] = {nb_base, D * nb_base};
     size_t nb_vo[2] = {nb_base, D * nb_base};
     size_t nb_q[1] = {nb_base};
 
+    // 获取缩放因子
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
 
+    // 预分配缓冲区，避免在循环中重复分配（性能优化1）
+    size_t buf_size = D * D * sizeof(float);
+    ggml_cann_pool_alloc state_buf1(ctx.pool(), buf_size);
+    void* buf1_ptr = state_buf1.get();
+    ggml_cann_pool_alloc state_buf2(ctx.pool(), buf_size);
+    void* buf2_ptr = state_buf2.get();
+    
+    // 创建可重用的缓冲区张量（性能优化2）
+    aclTensor* acl_buf_k = ggml_cann_create_tensor(buf1_ptr, ggml_cann_type_mapping(k->type), 
+                                                  ggml_type_size(k->type), ne_s, nb_s, 2);
+    aclTensor* acl_buf_v = ggml_cann_create_tensor(buf2_ptr, ggml_cann_type_mapping(k->type), 
+                                                  ggml_type_size(k->type), ne_s, nb_s, 2);
+    
+    // 预创建重复参数数组（性能优化3）
+    int64_t k_rep[2] = {1, D};      // k/g重复模式 [1,D] -> [D,D]
+    int64_t v_rep[2] = {D, 1};      // v重复模式 [D,1] -> [D,D]
+    aclIntArray* acl_k_rep = aclCreateIntArray(k_rep, 2);
+    aclIntArray* acl_v_rep = aclCreateIntArray(v_rep, 2);
+    
+    // 定义转置维度
+    int64_t newdim[2] = {1, 0};      // [D,D] -> [D,D] (转置)
+    
+    // 遍历批次、头和时间步
     for (int64_t b = 0; b < B; b++) {
         for (int64_t h = 0; h < H; h++) {
+            // 计算状态张量的偏移量
             size_t s_offset = (b * (H * D * D) + h * (D * D)) * nb_base;
-            // D * D
+            
+            // 创建状态张量
             aclTensor* acl_s = ggml_cann_create_tensor(s, ne_s, nb_s, 2, ACL_FORMAT_ND, s_offset);
-            aclTensor* acl_s_new = ggml_cann_create_tensor(dst, ne_s, nb_s, 2, ACL_FORMAT_ND, (B * L * H * D) * nb_base + s_offset);
+            aclTensor* acl_s_new = ggml_cann_create_tensor(dst, ne_s, nb_s, 2, ACL_FORMAT_ND, 
+                                                          (B * L * H * D) * nb_base + s_offset);
+            
+            // 复制初始状态
             cann_copy(ctx, acl_s, acl_s_new);
+            
+            // 遍历时间步，更新状态并计算输出
             for (int64_t l = 0; l < L; l++) {
+                // 计算当前时间步的qkvgo偏移量
                 size_t qkvgo_offset = (b * (L * H * D) + l * (H * D) + h * (D)) * nb_base;
-                // D * 1
+                
+                // 创建当前时间步所需的张量
                 aclTensor* acl_k = ggml_cann_create_tensor(k, ne_qkg, nb_qkg, 2, ACL_FORMAT_ND, qkvgo_offset);
                 aclTensor* acl_g = ggml_cann_create_tensor(g, ne_qkg, nb_qkg, 2, ACL_FORMAT_ND, qkvgo_offset);
-                // D
                 aclTensor* acl_q = ggml_cann_create_tensor(q, ne_q, nb_q, 1, ACL_FORMAT_ND, qkvgo_offset);
-                // 1 * D
                 aclTensor* acl_v = ggml_cann_create_tensor(v, ne_vo, nb_vo, 2, ACL_FORMAT_ND, qkvgo_offset);
-                // D
                 aclTensor* acl_o = ggml_cann_create_tensor(dst, ne_q, nb_q, 1, ACL_FORMAT_ND, qkvgo_offset);
-                // repeat k and v
-                // buffer for repeated k
-                size_t buf_size = D * D * sizeof(float);
-                ggml_cann_pool_alloc state_buf1(ctx.pool(), buf_size);
-                void* buf1_ptr = state_buf1.get();
-                aclTensor* acl_buf_k = ggml_cann_create_tensor(buf1_ptr, ggml_cann_type_mapping(k->type), ggml_type_size(k->type), ne_s, nb_s, 2);
-                // buffer for repeated v
-                ggml_cann_pool_alloc state_buf2(ctx.pool(), buf_size);
-                void* buf2_ptr = state_buf2.get();
-                aclTensor* acl_buf_v = ggml_cann_create_tensor(buf2_ptr, ggml_cann_type_mapping(k->type), ggml_type_size(k->type), ne_s, nb_s, 2);
-                // repeat
-                int64_t k_rep[2] = {1, D};
-                int64_t v_rep[2] = {D, 1};
-                // int64_t k_rep[2] = {D, 1};
-                // int64_t v_rep[2] = {1, D};
-                aclIntArray* acl_k_rep = aclCreateIntArray(k_rep, 2);
-                aclIntArray* acl_v_rep = aclCreateIntArray(v_rep, 2);
-                GGML_CANN_CALL_ACLNN_OP(ctx, Repeat, acl_k, acl_k_rep, acl_buf_k);
-                GGML_CANN_CALL_ACLNN_OP(ctx, Repeat, acl_v, acl_v_rep, acl_buf_v);
-                // inplace mul, saved in acl_buf_k
-                aclnn_mul(ctx, acl_buf_k, acl_buf_v, nullptr);
-                // apply g to s
-                // reuse acl_buf_v to store repeated g
-                GGML_CANN_CALL_ACLNN_OP(ctx, Repeat, acl_g, acl_k_rep, acl_buf_v);
-                aclnn_mul(ctx, acl_s_new, acl_buf_v, nullptr);
-                // add kv
-                aclnn_add(ctx, acl_s_new, acl_buf_k, nullptr);
-                // compute output
-                // permute state and store in acl_buf k
-                int64_t newdim[2] = {1, 0};
-                aclnn_permute(ctx, acl_s_new, acl_buf_k, newdim, 2);
-                GGML_CANN_CALL_ACLNN_OP(ctx, Mv, acl_buf_k, acl_q, acl_o, 1);
-                aclnn_muls(ctx, acl_o, scale, nullptr, true);
-                ggml_cann_release_resources(ctx, acl_q, acl_k, acl_v, acl_o, acl_g, acl_buf_k, acl_buf_v, acl_k_rep, acl_v_rep);
+                
+                // 1. 计算k*v外积
+                GGML_CANN_CALL_ACLNN_OP(ctx, Repeat, acl_k, acl_k_rep, acl_buf_k); // k广播到[D,D]
+                GGML_CANN_CALL_ACLNN_OP(ctx, Repeat, acl_v, acl_v_rep, acl_buf_v); // v广播到[D,D]
+                aclnn_mul(ctx, acl_buf_k, acl_buf_v, nullptr); // 元素级乘法 k*v
+                
+                // 2. 应用门控并更新状态
+                GGML_CANN_CALL_ACLNN_OP(ctx, Repeat, acl_g, acl_k_rep, acl_buf_v); // g广播到[D,D]
+                aclnn_mul(ctx, acl_s_new, acl_buf_v, nullptr); // 门控操作: s = s * g
+                aclnn_add(ctx, acl_s_new, acl_buf_k, nullptr); // 状态更新: s = s + k*v
+                
+                // 3. 计算输出
+                aclnn_permute(ctx, acl_s_new, acl_buf_k, newdim, 2); // 转置状态矩阵
+                GGML_CANN_CALL_ACLNN_OP(ctx, Mv, acl_buf_k, acl_q, acl_o, 1); // 矩阵向量乘法: o = s^T * q
+                aclnn_muls(ctx, acl_o, scale, nullptr, true); // 应用缩放因子
+                
+                // 释放当前时间步的临时张量
+                ggml_cann_release_resources(ctx, acl_q, acl_k, acl_v, acl_o, acl_g);
             }
+            
+            // 释放状态张量
             ggml_cann_release_resources(ctx, acl_s, acl_s_new);
         }
     }
+    
+    // 释放预分配的资源
+    ggml_cann_release_resources(ctx, acl_buf_k, acl_buf_v, acl_k_rep, acl_v_rep);
 }
 
 void ggml_cann_group_norm(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
