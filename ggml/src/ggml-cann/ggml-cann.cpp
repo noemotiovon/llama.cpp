@@ -1771,6 +1771,10 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context& ctx,
                     return false;
             }
             break;
+        // ===== OUT_PROD =====
+        case GGML_OP_OUT_PROD:
+            ggml_cann_out_prod(ctx, dst);
+            return true;
         case GGML_OP_NORM:
             ggml_cann_norm(ctx, dst);
             break;
@@ -2403,6 +2407,26 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev,
                     return false;
             }
         }
+
+        // ===== OUT_PROD =====
+        case GGML_OP_OUT_PROD: {
+            switch (op->src[0]->type) {
+                case GGML_TYPE_F32:
+                // case GGML_TYPE_F16:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1: 
+                case GGML_TYPE_Q4_K:
+                case GGML_TYPE_MXFP4:
+                case GGML_TYPE_IQ2_XXS:
+                    return op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+                    // return (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) && 
+                    //        (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16);
+                default:
+                    return false;
+            }
+        }
+
         case GGML_OP_ROPE: {
             // TODO: with ops-test v == 1
             float ext_factor = 0.0f;

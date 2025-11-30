@@ -187,6 +187,9 @@ void ggml_cann_argsort(ggml_backend_cann_context& ctx, ggml_tensor* dst);
  */
 void ggml_cann_norm(ggml_backend_cann_context& ctx, ggml_tensor* dst);
 
+
+void ggml_cann_out_prod(ggml_backend_cann_context & ctx, ggml_tensor * dst);
+
 /**
  * @brief  Computes the Group Normalization for a ggml tensor using the CANN
  *         backend.
