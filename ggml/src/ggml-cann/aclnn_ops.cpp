@@ -90,6 +90,7 @@
 #define GGML_COMMON_DECL_C
 
 #include "../ggml-common.h"
+using namespace std;
 
 
 void bcast_shape(ggml_tensor * src0, ggml_tensor * src1, ggml_tensor * dst, aclTensor ** acl_src0,
@@ -3433,146 +3434,153 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context& ctx, ggml_tensor* dst){
 }
 
 void ggml_cann_ssm_conv(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
-    ggml_tensor * src0 = dst->src[0];
-    ggml_tensor * src1 = dst->src[1];
+    ggml_tensor * src0 = dst->src[0];  // conv_x
+    ggml_tensor * src1 = dst->src[1];  // conv1d.weight
 
-    int64_t d_inner = dst->ne[0];
-    int64_t nt      = dst->ne[1];
-    int64_t ns      = dst->ne[2];
-    int64_t d_conv  = src1->ne[0];
-
-    GGML_ASSERT(src0->ne[0] == d_conv - 1 + nt);
-    GGML_ASSERT(src0->ne[1] == d_inner);
-    GGML_ASSERT(src0->ne[2] == ns);
-    GGML_ASSERT(src0->ne[3] == 1);
-
-    GGML_ASSERT(src1->ne[1] == d_inner);
-    GGML_ASSERT(src1->ne[2] == 1);
-    GGML_ASSERT(src1->ne[3] == 1);
-
-    GGML_ASSERT(dst->ne[3] == 1);
+    // This op is currently defined only for F32 in ggml_cpu
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
-    int64_t     x_ne[3] = { d_conv - 1 + nt, d_inner, ns };
-    size_t      x_nb[3] = { 1 * sizeof(float),
-                            (d_conv - 1 + nt) * sizeof(float),
-                            (d_conv - 1 + nt) * d_inner * sizeof(float) };
-    aclTensor * X       = ggml_cann_create_tensor(src0, x_ne, x_nb, 3, ACL_FORMAT_NCL);
-    int64_t     w_ne[3] = { d_conv, d_inner, d_inner };
-    size_t      w_nb[3] = { 1 * sizeof(float), d_conv * sizeof(float), d_conv * d_inner * sizeof(float) };
-    uint8_t *   w_data  = nullptr;
-    aclrtMalloc((void **) &w_data, d_inner * d_inner * d_conv * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST);
-    aclTensor * W1 = ggml_cann_create_tensor(
-        w_data, ACL_FLOAT, sizeof(float), w_ne, w_nb, 3, ACL_FORMAT_NCL);                   // [d_conv,d_inner,d_inner]
-    aclTensor *   W = ggml_cann_create_tensor(src1, src1->ne, src1->nb, 2, ACL_FORMAT_NC);  // [d_conv, d_inner]
-    int64_t       repeats_data[3] = { d_inner, 1, 1 };
-    aclIntArray * repeats         = aclCreateIntArray(repeats_data, 3);
+    // Shapes follow ggml_compute_forward_ssm_conv_f32
+    const int64_t nc  = src1->ne[0];    // d_conv
+    const int64_t ncs = src0->ne[0];    // d_conv - 1 + n_t
+    const int64_t nr  = src0->ne[1];    // d_inner
+    const int64_t n_s = src0->ne[2];    // n_seqs
 
-    uint8_t * eye_data = nullptr;
-    aclrtMalloc((void **) &eye_data, d_inner * d_inner * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST);
-    int64_t     eye_ne[2] = { d_inner, d_inner };
-    size_t      eye_nb[2] = { 1 * sizeof(float), d_inner * sizeof(float) };
-    aclTensor * eye = ggml_cann_create_tensor(eye_data, ACL_FLOAT, sizeof(float), eye_ne, eye_nb, 2, ACL_FORMAT_ND);
-    uint8_t *   eye_3d_data = nullptr;
-    aclrtMalloc((void **) &eye_3d_data, d_inner * d_inner * d_conv * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST);
-    int64_t     eye_3d_ne[3] = { d_inner, d_inner, d_conv };
-    size_t      eye_3d_nb[3] = { 1 * sizeof(float), d_inner * sizeof(float), d_inner * d_inner * sizeof(float) };
-    aclTensor * eye_3d =
-        ggml_cann_create_tensor(eye_3d_data, ACL_FLOAT, sizeof(float), eye_3d_ne, eye_3d_nb, 3, ACL_FORMAT_NCL);
+    const int64_t n_t = dst->ne[1];     // tokens per sequence
 
-    uint8_t * mask_data = nullptr;
-    aclrtMalloc((void **) &mask_data, d_inner * d_inner * d_conv * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST);
-    aclTensor * mask = ggml_cann_create_tensor(
-        mask_data, ACL_FLOAT, sizeof(float), w_ne, w_nb, 3, ACL_FORMAT_NCL);  // [d_conv,d_inner,d_inner]
-    int64_t       eye_repeats_data[3] = { d_conv, 1, 1 };
-    aclIntArray * eye_repeats         = aclCreateIntArray(eye_repeats_data, 3);
-    int64_t       eye_permute[3]      = { 1, 2, 0 };
-    aclIntArray * permute             = aclCreateIntArray(eye_permute, 3);
+    GGML_ASSERT(dst->ne[0] == nr);          // dst: {d_inner, n_t, n_s}
+    GGML_ASSERT(src1->ne[1] == nr);         // weight: {d_conv, d_inner}
+    GGML_ASSERT(ncs == nc - 1 + n_t);       // conv_x: {d_conv - 1 + n_t, d_inner, n_s}
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(src1->nb[0] == sizeof(float));
 
-    int64_t     y_ne[3] = { nt, d_inner, ns };
-    size_t      y_nb[3] = { d_inner * sizeof(float), 1 * sizeof(float), d_inner * nt * sizeof(float) };
-    aclTensor * Y       = ggml_cann_create_tensor(dst, y_ne, y_nb, 3, ACL_FORMAT_NCL);
+    // --- Build CANN tensors ---
 
-    int64_t       stride_data[1]   = { 1 };
-    aclIntArray * stride           = aclCreateIntArray(stride_data, 1);
-    int64_t       padding_data[1]  = { 0 };
-    aclIntArray * padding          = aclCreateIntArray(padding_data, 1);
-    int64_t       dilation_data[1] = { 1 };
-    aclIntArray * dilation         = aclCreateIntArray(dilation_data, 1);
-    bool          transposed       = false;
-    int64_t       groups           = 1;
-    int8_t        cubeMathType     = 0;
+    // 1) Input: conv_x as NCL
+    //
+    // src0->ne = { ncs, nr, n_s, 1 }  // {L_in, C, N}
+    // Passing ACL_FORMAT_NCL here means:
+    //   reversed dims -> [N, C, L_in] = [n_s, nr, ncs]
+    aclTensor * acl_x = ggml_cann_create_tensor(
+        src0,
+        src0->ne,
+        src0->nb,
+        3,
+        ACL_FORMAT_NCL
+    );
+
+    // 2) Weights: depthwise conv kernel, view src1 as {K, 1, C}
+    //
+    // src1 original:   ne = { nc, nr, 1, 1 }  // [K, C, 1, 1]
+    // we want a view:  ne_w = { nc, 1, nr }   // [K, 1, C]
+    // so that reversed dims -> [C, 1, K] which matches
+    //   [out_channels, in_channels/groups, kernel_size]
+    int64_t w_ne[GGML_MAX_DIMS] = { 0 };
+    size_t  w_nb[GGML_MAX_DIMS] = { 0 };
+
+    w_ne[0] = nc;              // K
+    w_ne[1] = 1;               // 1 input channel per group
+    w_ne[2] = nr;              // C groups
+    w_ne[3] = 1;
+
+    // Layout: src1 data is [K, C] with
+    //   offset(k, c) = k*nb0 + c*nb1
+    // We want offset_w(k, 0, c) = k*nb0 + c*nb1,
+    // so we can reuse nb0 and nb1, and set nb2 = nb1.
+    w_nb[0] = src1->nb[0];     // sizeof(float)
+    w_nb[1] = src1->nb[1];     // nc * sizeof(float)
+    w_nb[2] = src1->nb[1];     // same stride for each (fake) "channel"
+    w_nb[3] = src1->nb[3];
+
+    aclTensor * acl_w = ggml_cann_create_tensor(
+        src1->data,
+        ggml_cann_type_mapping(src1->type),
+        ggml_type_size(src1->type),
+        w_ne,
+        w_nb,
+        3,
+        ACL_FORMAT_NCL
+    );
+
+    // 3) Output: dst is { d_inner, n_t, n_s } (CLN)
+    //
+    // We need an NCL view of the same buffer:
+    //   desired NCL logical shape: { L_out = n_t, C = nr, N = n_s }
+    //
+    // Original CLN layout:
+    //   dst->ne = { nr, n_t, n_s }
+    //   dst->nb[0] = sizeof(float)
+    //   dst->nb[1] = nr * sizeof(float)
+    //   dst->nb[2] = nr * n_t * sizeof(float)
+    //
+    // We want offset_new(L, C, N) = offset_orig(C, L, N).
+    // Choose:
+    //   nb_y[0] = nr * sizeof(float);           // step in L
+    //   nb_y[1] = sizeof(float);                // step in C
+    //   nb_y[2] = nr * n_t * sizeof(float);     // step in N
+    int64_t y_ne[GGML_MAX_DIMS] = { 0 };
+    size_t  y_nb[GGML_MAX_DIMS] = { 0 };
+
+    y_ne[0] = n_t;        // L_out
+    y_ne[1] = nr;         // C
+    y_ne[2] = n_s;        // N
+    y_ne[3] = 1;
+
+    y_nb[0] = dst->ne[0] * sizeof(float);        // nr * sizeof(float)
+    y_nb[1] = sizeof(float);
+    y_nb[2] = dst->ne[0] * dst->ne[1] * sizeof(float); // nr * n_t * sizeof(float)
+    y_nb[3] = dst->nb[3];
+
+    aclTensor * acl_y = ggml_cann_create_tensor(
+        dst->data,
+        ggml_cann_type_mapping(dst->type),
+        ggml_type_size(dst->type),
+        y_ne,
+        y_nb,
+        3,
+        ACL_FORMAT_NCL
+    );
+
+    // --- Conv1d parameters: depthwise, stride 1, no padding ("valid") ---
+    int64_t strideVal[1]   = { 1 };
+    int64_t paddingVal[1]  = { 0 };
+    int64_t dilationVal[1] = { 1 };
+
+    aclIntArray * stride   = aclCreateIntArray(strideVal, 1);
+    aclIntArray * padding  = aclCreateIntArray(paddingVal, 1);
+    aclIntArray * dilation = aclCreateIntArray(dilationVal, 1);
+
+    const bool    transposed   = false;
+    const int64_t groups       = nr;        // depthwise: one group per inner dim
+    int8_t        cubeMathType = 0;
+
 #ifdef ASCEND_310P
     cubeMathType = 1;
 #endif
 
-    GGML_CANN_CALL_ACLNN_OP(ctx, Repeat, W, repeats, W1);
-    GGML_CANN_CALL_ACLNN_OP(ctx, Eye, d_inner, d_inner, eye);
-    GGML_CANN_CALL_ACLNN_OP(ctx, Repeat, eye, eye_repeats, eye_3d);
-    GGML_CANN_CALL_ACLNN_OP(ctx, Permute, eye_3d, permute, mask);
-    GGML_CANN_CALL_ACLNN_OP(ctx, InplaceMul, W1, mask);
     GGML_CANN_CALL_ACLNN_OP(
-        ctx, Convolution, X, W1, nullptr, stride, padding, dilation, transposed, padding, groups, Y, cubeMathType);
+        ctx,
+        Convolution,
+        acl_x,          // input:  N, C, L_in = ncs
+        acl_w,          // weight: [C, 1, K] with groups=nr
+        nullptr,        // bias
+        stride,
+        padding,
+        dilation,
+        transposed,
+        padding,        // output padding (unused for non-transposed)
+        groups,
+        acl_y,
+        cubeMathType
+    );
 
-#ifdef GGML_CANN_SSM_CONV_CHECK
-    std::vector<float> y_local(y_ne[0] * y_ne[1] * y_ne[2]);
-    std::vector<float> x_local(x_ne[0] * x_ne[1] * x_ne[2]);
-    std::vector<float> w_local(w_ne[0] * w_ne[1] * w_ne[2]);
-    aclrtMemcpy(
-        x_local.data(), x_local.size() * sizeof(float), src0->data, ggml_nbytes(src0), ACL_MEMCPY_DEVICE_TO_HOST);
-    aclrtMemcpy(w_local.data(),
-                w_local.size() * sizeof(float),
-                w_data,
-                w_local.size() * sizeof(float),
-                ACL_MEMCPY_DEVICE_TO_HOST);
-
-    for (int i = 0; i < ns; i++) {
-        for (int j = 0; j < d_inner; j++) {
-            for (int k = 0; k < nt; k++) {
-                float sum = 0.0;
-                for (int m = 0; m < d_inner; m++) {
-                    for (int l = 0; l < d_conv; l++) {
-                        int idx1 = (j * w_nb[2] + m * w_nb[1] + l * w_nb[0]) / sizeof(float);
-                        GGML_ASSERT(j < w_ne[2]);
-                        GGML_ASSERT(m < w_ne[1]);
-                        GGML_ASSERT(l < w_ne[0]);
-                        GGML_ASSERT(idx1 < w_local.size());
-                        int idx2 = (i * x_nb[2] + m * x_nb[1] + (k + l) * x_nb[0]) / sizeof(float);
-                        GGML_ASSERT(i < x_ne[2]);
-                        GGML_ASSERT(m < x_ne[1]);
-                        GGML_ASSERT(k + l < x_ne[0]);
-                        GGML_ASSERT(idx2 < x_local.size());
-                        sum += w_local[idx1] * x_local[idx2];
-                    }
-                }
-                int idx3 = (i * y_nb[2] + j * y_nb[1] + k * y_nb[0]) / sizeof(float);
-                GGML_ASSERT(i < y_ne[2]);
-                GGML_ASSERT(j < y_ne[1]);
-                GGML_ASSERT(k < y_ne[0]);
-                GGML_ASSERT(idx3 < y_local.size());
-                y_local[idx3] = sum;
-            }
-        }
-    }
-
-    std::vector<float> y_got(y_ne[0] * y_ne[1] * y_ne[2]);
-    aclrtMemcpy(y_got.data(), y_got.size() * sizeof(float), dst->data, ggml_nbytes(dst), ACL_MEMCPY_DEVICE_TO_HOST);
-    aclrtMemcpy(dst->data, y_got.size() * sizeof(float), y_local.data(), ggml_nbytes(dst), ACL_MEMCPY_DEVICE_TO_HOST);
-
-#    define min(a, b) ((a) > (b) ? (b) : (a))
-    for (int i = 0; i < min(y_got.size(), 10); i++) {
-        std::cout << y_local[i] << " ";
-    }
-    std::cout << "\n";
-    for (int i = 0; i < min(y_got.size(), 10); i++) {
-        std::cout << y_got[i] << " ";
-    }
-    std::cout << "\n";
-#    undef min
-#endif
-
-    ggml_cann_release_resources(
-        ctx, W, repeats, W1, eye, eye_repeats, eye_3d, permute, mask, X, stride, padding, dilation, Y);
+    // --- cleanup ---
+    ACL_CHECK(aclDestroyTensor(acl_x));
+    ACL_CHECK(aclDestroyTensor(acl_w));
+    ACL_CHECK(aclDestroyTensor(acl_y));
+    ACL_CHECK(aclDestroyIntArray(stride));
+    ACL_CHECK(aclDestroyIntArray(padding));
+    ACL_CHECK(aclDestroyIntArray(dilation));
 }
