@@ -2008,12 +2008,12 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
     // HC is regarded as batch.
     // weight need transpose.
     float weight_elem_size;
-    if (type == GGML_TYPE_Q4_0) {
+    if (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1) {
         weight_elem_size = float(sizeof(uint8_t)) / 2;
-    } else if (type == GGML_TYPE_Q8_0) {
+    } else if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q8_1) {
         weight_elem_size = float(sizeof(uint8_t));
     } else {
-        GGML_ABORT("Only support Q4_0 and Q8_0 MUL_MAT");
+        GGML_ABORT("Only support Q4_0, Q4_1, Q8_0 and Q8_1 MUL_MAT");
     }
     float weight_nb[] = {src0->ne[0] * weight_elem_size, weight_elem_size};
     size_t weight_stride = src0->ne[1] * src0->ne[0] * weight_elem_size;
@@ -2024,7 +2024,14 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
     size_t scale_nb[] = {src0->ne[0] / QK8_0 * scale_elem_size,
                          scale_elem_size};
     size_t scale_stride = src0->ne[1] * src0->ne[0] / QK8_0 * scale_elem_size;
+    size_t scale_size = scale_stride * src0->ne[2] * src0->ne[3];
     char* scale_offset = (char*)src0->data + weight_size;
+
+    // min. Also need transpose.
+    size_t min_elem_size;
+    size_t min_nb[2];
+    size_t min_stride;
+    char* min_offset;   
 
     // input
     size_t input_elem_size = sizeof(uint16_t);
@@ -2034,7 +2041,7 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
     ggml_cann_pool_alloc input_alloctor(ctx.pool());
     void* input_buffer = src1->data;
 
-    // case in
+    // cast in
     if (src1->type != GGML_TYPE_F16) {
         aclTensor* acl_src1_tensor = ggml_cann_create_tensor(src1);
         input_buffer =
@@ -2079,12 +2086,14 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
                 input_elem_size, input_ne, input_nb, 2);
 
             // first split
-            int64_t weight_ne_offset = 0;
+            int64_t weight_ne_offset = 0; 
             int64_t weight_ne[2] = {
                 max_elem_size > src0->ne[1] ? src0->ne[1] : max_elem_size,
                 src0->ne[0]};
             int64_t scale_ne_offset = 0;
             int64_t scale_ne[2] = {weight_ne[0], weight_ne[1] / QK8_0};
+            int64_t min_ne_offset = 0;
+            int64_t min_ne[2] = {weight_ne[0], weight_ne[1] / QK4_1};
             int64_t output_ne_offset = 0;
             int64_t output_ne[2] = {weight_ne[0], dst->ne[1]};
 
@@ -2096,6 +2105,18 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
                 scale_offset + batch0 * scale_stride, ACL_FLOAT16,
                 scale_elem_size, scale_ne, scale_nb, 2, ACL_FORMAT_ND,
                 scale_ne_offset);
+            aclTensor* acl_min_tensor = nullptr;
+            if (src0->type == GGML_TYPE_Q4_1) {
+                min_elem_size = sizeof(uint16_t);
+                min_nb[0] = src0->ne[0] / QK4_1 * min_elem_size;
+                min_nb[1] = min_elem_size;
+                min_stride = src0->ne[1] * src0->ne[0] / QK4_1 * min_elem_size;
+                min_offset = (char*)src0->data + weight_size + scale_size;   
+
+                acl_min_tensor = ggml_cann_create_tensor(
+                    min_offset + batch0 * min_stride, ACL_FLOAT16,
+                    min_elem_size, min_ne, min_nb, 2, ACL_FORMAT_ND, min_ne_offset);
+            }
             aclTensor* acl_output_tensor = ggml_cann_create_tensor(
                 (char*)output_buffer + batch1 * output_stride, ACL_FLOAT16,
                 output_elem_size, output_ne, output_nb, 2, ACL_FORMAT_ND,
@@ -2105,10 +2126,10 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
                 antiquantGroupSize = QK8_0;
             }
             GGML_CANN_CALL_ACLNN_OP(ctx, WeightQuantBatchMatmulV2, acl_input_tensor,
-                           acl_weight_tensor, acl_scale_tensor, nullptr,
+                           acl_weight_tensor, acl_scale_tensor, acl_min_tensor,
                            nullptr, nullptr, nullptr, antiquantGroupSize,
                            acl_output_tensor);
-            ggml_cann_release_resources(ctx, acl_weight_tensor, acl_scale_tensor, acl_output_tensor);
+            ggml_cann_release_resources(ctx, acl_weight_tensor, acl_scale_tensor, acl_min_tensor, acl_output_tensor);
 
             // other splits
             for (int64_t split = 1; split < split_size; split++) {
@@ -2131,15 +2152,23 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
                     scale_offset + batch0 * scale_stride, ACL_FLOAT16,
                     scale_elem_size, scale_ne, scale_nb, 2, ACL_FORMAT_ND,
                     scale_ne_offset);
+                acl_min_tensor = nullptr;
+                if (src0->type == GGML_TYPE_Q4_1) {
+                    min_ne_offset += min_elem_size * min_ne[0] * min_ne[1];
+                    min_ne[0] = weight_ne[0];
+                    acl_min_tensor = ggml_cann_create_tensor(
+                        min_offset + batch0 * min_stride, ACL_FLOAT16,
+                        min_elem_size, min_ne, min_nb, 2, ACL_FORMAT_ND, min_ne_offset);
+                }
                 acl_output_tensor = ggml_cann_create_tensor(
                     (char*)output_buffer + batch1 * output_stride, ACL_FLOAT16,
                     output_elem_size, output_ne, output_nb, 2, ACL_FORMAT_ND,
                     output_ne_offset);
                 GGML_CANN_CALL_ACLNN_OP(ctx, WeightQuantBatchMatmulV2, acl_input_tensor,
-                                   acl_weight_tensor, acl_scale_tensor, nullptr,
+                                   acl_weight_tensor, acl_scale_tensor, acl_min_tensor,
                                    nullptr, nullptr, nullptr, antiquantGroupSize,
                                    acl_output_tensor);
-                ggml_cann_release_resources(ctx, acl_weight_tensor, acl_scale_tensor, acl_output_tensor);
+                ggml_cann_release_resources(ctx, acl_weight_tensor, acl_scale_tensor, acl_min_tensor, acl_output_tensor);
             }
 
             ggml_cann_release_resources(ctx, acl_input_tensor);
@@ -2174,6 +2203,8 @@ void ggml_cann_mul_mat(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
             break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q8_1:
             ggml_cann_mul_mat_quant(ctx, dst, type);
             break;
         default:
