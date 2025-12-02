@@ -6,7 +6,6 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
-#include <iostream>
 #include <float.h>
 #include <algorithm>
 
