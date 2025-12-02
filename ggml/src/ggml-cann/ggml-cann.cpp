@@ -2407,10 +2407,10 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev,
             // TODO: with ops-test v == 1
             float ext_factor = 0.0f;
             memcpy(&ext_factor, (const float *) op->op_params + 7, sizeof(float));
-            // TODO: n_dims <= ne0
-            if (op->src[0]->ne[0] != op->op_params[1]) {
-                return false;
-            }
+            // // TODO: n_dims <= ne0
+            // if (op->src[0]->ne[0] != op->op_params[1]) {
+            //     return false;
+            // }
             // TODO: ext_factor != 0
             if (ext_factor != 0) {
                 return false;
