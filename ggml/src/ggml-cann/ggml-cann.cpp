@@ -946,6 +946,69 @@ static void ggml_backend_cann_transform_back_q4_0(
 }
 
 /**
+ * @brief Transform quantized Q4.1 tensor data into a format suitable for CANN
+ * processing.
+ *
+ * This function transforms quantized Q4.1 tensor data into a format suitable
+ * for CANN processing. It extracts quantization values and scales from the
+ * source data and prepares them in a format expected by CANN operations.
+ *
+ * @param tensor Pointer to the tensor information.
+ * @param src Pointer to the source data in Q4.1 format.
+ * @param dst Pointer to the destination buffer where transformed data will be
+ * stored.
+ */
+static void ggml_backend_cann_transform_q4_1(ggml_tensor* tensor,
+                                             const void* src,
+                                             void* dst) {
+
+    int64_t n_elems = ggml_nelements(tensor);
+    int64_t groups = n_elems / QK4_1;
+    size_t quant_bytes = n_elems * sizeof(uint8_t) / 2;
+    size_t scale_bytes = groups * sizeof(uint16_t);
+
+    uint8_t* quant_offset = (uint8_t*)dst;
+    uint16_t* scale_offset = (uint16_t*)((char*)dst + quant_bytes);
+    uint16_t* min_offset = (uint16_t*)((char*)dst + quant_bytes + scale_bytes);
+
+    for (int i = 0; i < groups; i++) {
+        const block_q4_1* group =
+            (const block_q4_1*)((const char*)src + i * sizeof(block_q4_1));
+        *scale_offset = group->d;
+        scale_offset++;
+
+        float d = ggml_fp16_to_fp32(group->d);
+        float m = ggml_fp16_to_fp32(group->m);
+        
+        float min = 0.0f;
+        if (d != 0.0f)
+            min = 8.0f + (m / d);
+        *min_offset = ggml_fp32_to_fp16(min);
+        min_offset++;
+
+        // 0-15
+        for (int j = 0; j < QK4_1 / 2; j += 2) {
+            (*quant_offset) = (group->qs[j] & 0x0F);
+            (*quant_offset) |= ((group->qs[j + 1] << 4));
+            quant_offset++;
+        }
+
+        // 16-31
+        for (int j = 0; j < QK4_1 / 2; j += 2) {
+            (*quant_offset) = (group->qs[j] >> 4);
+            (*quant_offset) |= (group->qs[j + 1] & 0xF0);
+            quant_offset++;
+        }
+    }
+
+    // put (uint4b_t -8) into int4b_t
+    for (quant_offset = (uint8_t*)dst;
+         quant_offset < (uint8_t*)dst + quant_bytes; quant_offset++) {
+        (*quant_offset) ^= 0x88;
+    }
+}
+
+/**
  * @brief Transform quantized Q8.0 tensor data into a format suitable for CANN
  * processing.
  *
@@ -1013,6 +1076,44 @@ static void ggml_backend_cann_transform_back_q8_0(
 }
 
 /**
+ * @brief Transform quantized Q8.1 tensor data into a format suitable for CANN
+ * processing.
+ *
+ * This function transforms quantized Q8.1 tensor data into a format suitable
+ * for CANN processing. It extracts quantization values and scales from the
+ * source data and prepares them in a format expected by CANN operations.
+ *
+ * @param tensor Pointer to the tensor information.
+ * @param src Pointer to the source data in Q8.1 format.
+ * @param dst Pointer to the destination buffer where transformed data will be
+ * stored.
+ */
+static void ggml_backend_cann_transform_q8_1(ggml_tensor* tensor,
+                                             const void* src,
+                                             void* dst) {
+    int64_t n_elems = ggml_nelements(tensor);
+    int64_t groups = n_elems / QK8_1;
+    size_t quant_bytes = n_elems * sizeof(uint8_t);
+    size_t scale_bytes = groups * sizeof(uint16_t);
+
+    uint8_t* quant_offset = (uint8_t*)dst;
+    uint16_t* scale_offset = (uint16_t*)((char*)dst + quant_bytes);
+    uint16_t* sum_offset = (uint16_t*)((char*)dst + quant_bytes + scale_bytes);
+
+    for (int i = 0; i < groups; i++) {
+        const block_q8_1* group =
+            (const block_q8_1*)((const char*)src + i * sizeof(block_q8_1));
+        *scale_offset = group->d;
+        scale_offset++;
+        *sum_offset = group->s;
+        sum_offset++;
+        size_t group_quant_size = QK8_1 * sizeof(uint8_t);
+        memcpy(quant_offset, group->qs, group_quant_size);
+        quant_offset += group_quant_size;
+    }
+}
+
+/**
  * @brief Transform tensor data based on its type for CANN processing.
  *
  * This function transforms tensor data based on its quantization type for CANN
@@ -1032,6 +1133,12 @@ static void ggml_backend_cann_transform(ggml_tensor* tensor,
             break;
         case GGML_TYPE_Q8_0:
             ggml_backend_cann_transform_q8_0(tensor, src, dst);
+            break;
+        case GGML_TYPE_Q4_1:
+            ggml_backend_cann_transform_q4_1(tensor, src, dst);
+            break;
+        case GGML_TYPE_Q8_1:
+            ggml_backend_cann_transform_q8_1(tensor, src, dst);
             break;
         default:
             break;
@@ -1077,6 +1184,8 @@ static bool need_transform(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q8_1:
             return true;
         default:
             return false;
@@ -2293,7 +2402,7 @@ static enum ggml_status ggml_backend_cann_graph_compute(
  *              otherwise false.
  */
 static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev,
-                                                    const ggml_tensor* op) {
+                                                    const ggml_tensor* op) {                                              
     switch (op->op) {
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
@@ -2335,6 +2444,8 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev,
                     return true;
                 case GGML_TYPE_Q8_0:
                 case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q8_1:
+                case GGML_TYPE_Q4_1:
 #ifdef ASCEND_310P
                     // Q4 && Q8 per group is not suppor on 310p device
                     return false;
