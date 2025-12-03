@@ -5336,24 +5336,6 @@ void ggml_compute_forward_get_rows(
                 GGML_ABORT("fatal error");
             }
     }
-
-    //static bool first = true;
-    //printf("ne0 = %d, ne1 = %d, ne2 = %d\n", dst->ne[0], dst->ne[1], dst->ne[2]);
-    //if (first) {
-    //    first = false;
-    //} else {
-    //    for (int k = 0; k < dst->ne[1]; ++k) {
-    //        for (int j = 0; j < dst->ne[0]/16; ++j) {
-    //            for (int i = 0; i < 16; ++i) {
-    //                printf("%8.4f ", ((float *) dst->data)[k*dst->ne[0] + j*16 + i]);
-    //            }
-    //            printf("\n");
-    //        }
-    //        printf("\n");
-    //    }
-    //    printf("\n");
-    //    exit(0);
-    //}
 }
 
 static void ggml_compute_forward_set_rows_f32(
@@ -5512,24 +5494,6 @@ void ggml_compute_forward_get_rows_back(
                 GGML_ABORT("fatal error");
             }
     }
-
-    //static bool first = true;
-    //printf("ne0 = %d, ne1 = %d, ne2 = %d\n", dst->ne[0], dst->ne[1], dst->ne[2]);
-    //if (first) {
-    //    first = false;
-    //} else {
-    //    for (int k = 0; k < dst->ne[1]; ++k) {
-    //        for (int j = 0; j < dst->ne[0]/16; ++j) {
-    //            for (int i = 0; i < 16; ++i) {
-    //                printf("%8.4f ", ((float *) dst->data)[k*dst->ne[0] + j*16 + i]);
-    //            }
-    //            printf("\n");
-    //        }
-    //        printf("\n");
-    //    }
-    //    printf("\n");
-    //    exit(0);
-    //}
 }
 
 // ggml_compute_forward_diag
@@ -6098,7 +6062,7 @@ static void ggml_mrope_cache_init(
     int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
     int sec_w = sections[1] + sections[0];
     int sec_e = sections[2] + sec_w;
-    GGML_ASSERT(sect_dims <= ne0);
+    GGML_ASSERT(sect_dims <= ne0);          // ne0 == n_dims
 
     for (int64_t i0 = 0; i0 < ne0; i0 += 2) {
         const float ff = freq_factors ? freq_factors[i0/2] : 1.0f;
@@ -6172,9 +6136,6 @@ static void ggml_compute_forward_rope_f32(
 
     GGML_TENSOR_UNARY_OP_LOCALS
 
-    //printf("ne0: %d, ne1: %d, ne2: %d, ne3: %d\n", ne0, ne1, ne2, ne3);
-    //printf("n_past = %d, ne2 = %d\n", n_past, ne2);
-
     GGML_ASSERT(nb00 == sizeof(float));
 
     const int ith = params->ith;
@@ -6228,7 +6189,6 @@ static void ggml_compute_forward_rope_f32(
 
     for (int64_t i3 = 0; i3 < ne3; i3++) { // batch
         for (int64_t i2 = 0; i2 < ne2; i2++) { // seq-len
-
             float * cache = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32)*ith;
             if (!is_mrope) {
                 const int64_t p = pos[i2];
@@ -6342,10 +6302,8 @@ static void ggml_compute_forward_rope_f16(
     float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
     int sections[4];
 
-    //const int n_past     = ((int32_t *) dst->op_params)[0];
     const int n_dims     = ((int32_t *) dst->op_params)[1];
     const int mode       = ((int32_t *) dst->op_params)[2];
-    //const int n_ctx      = ((int32_t *) dst->op_params)[3];
     const int n_ctx_orig = ((int32_t *) dst->op_params)[4];
     memcpy(&freq_base,   (int32_t *) dst->op_params +  5, sizeof(float));
     memcpy(&freq_scale,  (int32_t *) dst->op_params +  6, sizeof(float));
@@ -6357,9 +6315,6 @@ static void ggml_compute_forward_rope_f16(
 
 
     GGML_TENSOR_UNARY_OP_LOCALS
-
-    //printf("ne0: %d, ne1: %d, ne2: %d, ne3: %d\n", ne0, ne1, ne2, ne3);
-    //printf("n_past = %d, ne2 = %d\n", n_past, ne2);
 
     GGML_ASSERT(nb0 == sizeof(ggml_fp16_t));
 

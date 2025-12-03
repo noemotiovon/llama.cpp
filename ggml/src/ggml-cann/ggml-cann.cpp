@@ -1836,9 +1836,6 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context& ctx,
         case GGML_OP_SOFT_MAX:
             ggml_cann_softmax(ctx, dst);
             break;
-        case GGML_OP_ROPE:
-            ggml_cann_rope(ctx, dst);
-            break;
         case GGML_OP_IM2COL:
             ggml_cann_im2col(ctx, dst);
             break;
@@ -1881,6 +1878,10 @@ static bool ggml_cann_compute_forward(ggml_backend_cann_context& ctx,
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cann_flash_attn_ext(ctx, dst);
             break;
+        case GGML_OP_ROPE: {
+                ggml_cann_rope(ctx, dst);
+            break;
+        }
         default:
             return false;
     }
@@ -2407,25 +2408,34 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev,
             // TODO: with ops-test v == 1
             float ext_factor = 0.0f;
             memcpy(&ext_factor, (const float *) op->op_params + 7, sizeof(float));
-            // TODO: n_dims <= ne0
-            if (op->src[0]->ne[0] != op->op_params[1]) {
-                return false;
-            }
             // TODO: ext_factor != 0
-            if (ext_factor != 0) {
-                return false;
-            }
+
 
             const int mode = ((const int32_t *) op->op_params)[2];
-            if (mode & GGML_ROPE_TYPE_MROPE) {
-                return false;
+            if (ext_factor != 0) {
+                if (mode != GGML_ROPE_TYPE_MROPE) {
+                    return false;
+                }
             }
-            if (mode & GGML_ROPE_TYPE_VISION) {
-                return false;
+            
+            // TODO: n_dims <= ne0
+            if (op->src[0]->ne[0] != op->op_params[1]) {
+                if (mode != GGML_ROPE_TYPE_MROPE) {
+                    return false;
+                }
             }
 
+            //if (mode & GGML_ROPE_TYPE_MROPE) {
+            //    return false;
+            //}
+            //if (mode & GGML_ROPE_TYPE_VISION) {
+            //    return false;
+            //}
+
             if(!ggml_is_contiguous(op->src[0])){
-                return false;
+                if(mode != GGML_ROPE_TYPE_MROPE){
+                    return false;
+                }
             }
             return true;
         }

@@ -479,6 +479,18 @@ void ggml_cann_mul_mat(ggml_backend_cann_context& ctx, ggml_tensor* dst);
  */
 void ggml_cann_rope(ggml_backend_cann_context& ctx, ggml_tensor* dst);
 
+
+/**
+ * @brief   Applies Multimodal Rotary Positional Embedding (MROPE).
+ *
+ * @details Handles RoPE with multiple position IDs mapped to different sections
+ * of the head dimension.
+ *
+ * @param ctx The backend CANN context.
+ * @param dst The destination tensor.
+ */
+void ggml_cann_rope_multi(ggml_backend_cann_context& ctx, ggml_tensor* dst);
+
 /**
  * @brief   Computes the index of the maximum value along the specified dimension
  *          of a ggml tensor using the CANN backend.
