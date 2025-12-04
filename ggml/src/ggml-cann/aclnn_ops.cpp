@@ -2010,10 +2010,14 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
     float weight_elem_size;
     if (type == GGML_TYPE_Q4_0) {
         weight_elem_size = float(sizeof(uint8_t)) / 2;
+    } else if (type == GGML_TYPE_Q4_1) {
+        weight_elem_size = float(sizeof(uint8_t)) / 2;
     } else if (type == GGML_TYPE_Q8_0) {
         weight_elem_size = float(sizeof(uint8_t));
+    } else if (type == GGML_TYPE_Q8_1) {
+        weight_elem_size = float(sizeof(uint8_t));
     } else {
-        GGML_ABORT("Only support Q4_0 and Q8_0 MUL_MAT");
+        GGML_ABORT("Only support Q4_0, Q4_1, Q8_0 and Q8_1 MUL_MAT");
     }
     float weight_nb[] = {src0->ne[0] * weight_elem_size, weight_elem_size};
     size_t weight_stride = src0->ne[1] * src0->ne[0] * weight_elem_size;
@@ -2025,6 +2029,14 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
                          scale_elem_size};
     size_t scale_stride = src0->ne[1] * src0->ne[0] / QK8_0 * scale_elem_size;
     char* scale_offset = (char*)src0->data + weight_size;
+
+    // offset (m for Q4_1, s for Q8_1) stored after scale
+    // For Q4_0/Q8_0, offset_offset will be used but offset tensor will be nullptr
+    char* offset_offset = scale_offset + scale_stride * src0->ne[2] * src0->ne[3];
+    size_t offset_elem_size = sizeof(uint16_t);
+    size_t offset_nb[] = {src0->ne[0] / QK8_0 * offset_elem_size,
+                          offset_elem_size};
+    size_t offset_stride = src0->ne[1] * src0->ne[0] / QK8_0 * offset_elem_size;
 
     // input
     size_t input_elem_size = sizeof(uint16_t);
@@ -2096,6 +2108,18 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
                 scale_offset + batch0 * scale_stride, ACL_FLOAT16,
                 scale_elem_size, scale_ne, scale_nb, 2, ACL_FORMAT_ND,
                 scale_ne_offset);
+            
+            // Create offset tensor for Q4_1 only (m parameter)
+            // Q8_1 doesn't need offset - it uses signed int8 like Q8_0
+            aclTensor* acl_offset_tensor = nullptr;
+            int64_t offset_ne_offset = 0;
+            if (type == GGML_TYPE_Q4_1) {
+                acl_offset_tensor = ggml_cann_create_tensor(
+                    offset_offset + batch0 * offset_stride, ACL_FLOAT16,
+                    offset_elem_size, scale_ne, offset_nb, 2, ACL_FORMAT_ND,
+                    offset_ne_offset);
+            }
+            
             aclTensor* acl_output_tensor = ggml_cann_create_tensor(
                 (char*)output_buffer + batch1 * output_stride, ACL_FLOAT16,
                 output_elem_size, output_ne, output_nb, 2, ACL_FORMAT_ND,
@@ -2105,10 +2129,15 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
                 antiquantGroupSize = QK8_0;
             }
             GGML_CANN_CALL_ACLNN_OP(ctx, WeightQuantBatchMatmulV2, acl_input_tensor,
-                           acl_weight_tensor, acl_scale_tensor, nullptr,
+                           acl_weight_tensor, acl_scale_tensor, acl_offset_tensor,
                            nullptr, nullptr, nullptr, antiquantGroupSize,
                            acl_output_tensor);
-            ggml_cann_release_resources(ctx, acl_weight_tensor, acl_scale_tensor, acl_output_tensor);
+            if (acl_offset_tensor) {
+                ggml_cann_release_resources(ctx, acl_weight_tensor, acl_scale_tensor, 
+                                          acl_offset_tensor, acl_output_tensor);
+            } else {
+                ggml_cann_release_resources(ctx, acl_weight_tensor, acl_scale_tensor, acl_output_tensor);
+            }
 
             // other splits
             for (int64_t split = 1; split < split_size; split++) {
@@ -2131,15 +2160,32 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
                     scale_offset + batch0 * scale_stride, ACL_FLOAT16,
                     scale_elem_size, scale_ne, scale_nb, 2, ACL_FORMAT_ND,
                     scale_ne_offset);
+                
+                // Create offset tensor for Q4_1 only in splits
+                // Q8_1 doesn't need offset - it uses signed int8 like Q8_0
+                acl_offset_tensor = nullptr;
+                if (type == GGML_TYPE_Q4_1) {
+                    offset_ne_offset += offset_elem_size * scale_ne[0] * scale_ne[1];
+                    acl_offset_tensor = ggml_cann_create_tensor(
+                        offset_offset + batch0 * offset_stride, ACL_FLOAT16,
+                        offset_elem_size, scale_ne, offset_nb, 2, ACL_FORMAT_ND,
+                        offset_ne_offset);
+                }
+                
                 acl_output_tensor = ggml_cann_create_tensor(
                     (char*)output_buffer + batch1 * output_stride, ACL_FLOAT16,
                     output_elem_size, output_ne, output_nb, 2, ACL_FORMAT_ND,
                     output_ne_offset);
                 GGML_CANN_CALL_ACLNN_OP(ctx, WeightQuantBatchMatmulV2, acl_input_tensor,
-                                   acl_weight_tensor, acl_scale_tensor, nullptr,
+                                   acl_weight_tensor, acl_scale_tensor, acl_offset_tensor,
                                    nullptr, nullptr, nullptr, antiquantGroupSize,
                                    acl_output_tensor);
-                ggml_cann_release_resources(ctx, acl_weight_tensor, acl_scale_tensor, acl_output_tensor);
+                if (acl_offset_tensor) {
+                    ggml_cann_release_resources(ctx, acl_weight_tensor, acl_scale_tensor, 
+                                              acl_offset_tensor, acl_output_tensor);
+                } else {
+                    ggml_cann_release_resources(ctx, acl_weight_tensor, acl_scale_tensor, acl_output_tensor);
+                }
             }
 
             ggml_cann_release_resources(ctx, acl_input_tensor);
@@ -2160,7 +2206,6 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context& ctx,
             output_cast_nb, GGML_MAX_DIMS);
         aclTensor* acl_dst_tensor = ggml_cann_create_tensor(dst);
         aclnn_cast(ctx, acl_output_tensor, acl_dst_tensor, ggml_cann_type_mapping(dst->type));
-
         ggml_cann_release_resources(ctx, acl_output_tensor, acl_dst_tensor);
     }
 }
@@ -2173,7 +2218,9 @@ void ggml_cann_mul_mat(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
             ggml_cann_mat_mul_fp(ctx, dst);
             break;
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_1:
             ggml_cann_mul_mat_quant(ctx, dst, type);
             break;
         default:
@@ -3087,10 +3134,14 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context& ctx, ggml_tens
     float weight_elem_size;
     if (type == GGML_TYPE_Q4_0) {
         weight_elem_size = float(sizeof(uint8_t)) / 2;
+    } else if (type == GGML_TYPE_Q4_1) {
+        weight_elem_size = float(sizeof(uint8_t)) / 2;
     } else if (type == GGML_TYPE_Q8_0) {
         weight_elem_size = float(sizeof(uint8_t));
+    } else if (type == GGML_TYPE_Q8_1) {
+        weight_elem_size = float(sizeof(uint8_t));
     } else {
-        GGML_ABORT("MUL_MAT_ID only support quant type Q4_0 and Q8_0 ");
+        GGML_ABORT("MUL_MAT_ID only support quant type Q4_0, Q4_1, Q8_0 and Q8_1");
     }
 
     // src0_row [D, M, 1, 1] weight without permute
@@ -3106,6 +3157,10 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context& ctx, ggml_tens
     // scale [D, M, 1, 1] -> scale && permute
     size_t scale_elem_size = sizeof(uint16_t);
     size_t scale_stride = src0->ne[1] * src0->ne[0] / QK8_0 * scale_elem_size;
+
+    // offset [D, M, 1, 1] for Q4_1/Q8_1 -> offset (m/s) && permute
+    size_t offset_elem_size = sizeof(uint16_t);
+    size_t offset_stride = src0->ne[1] * src0->ne[0] / QK8_0 * offset_elem_size;
 
     // src1_row [D, 1, 1, 1] -> input
     src1_row.ne[1] = 1;
@@ -3148,6 +3203,15 @@ static void ggml_cann_mul_mat_id_quant(ggml_backend_cann_context& ctx, ggml_tens
             void* scale_buffer = (char*)weight_buffer + weight_stride;
             ggml_cann_async_memcpy(ctx, scale_buffer, scale_tmp_ptr, scale_stride,
                 ACL_MEMCPY_DEVICE_TO_DEVICE);
+            
+            // Copy offset (m) for Q4_1 only
+            // Q8_1 doesn't need offset - it uses signed int8 like Q8_0
+            if (type == GGML_TYPE_Q4_1) {
+                void* offset_tmp_ptr = src0_original + weight_size + scale_stride * ne02 * ne03 + i02*offset_stride;
+                void* offset_buffer = (char*)scale_buffer + scale_stride;
+                ggml_cann_async_memcpy(ctx, offset_buffer, offset_tmp_ptr, offset_stride,
+                    ACL_MEMCPY_DEVICE_TO_DEVICE);
+            }
 
             src0_row.data = weight_buffer;
             src1_row.data = src1_tmp_ptr;
@@ -3169,7 +3233,9 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context& ctx, ggml_tensor* dst) {
             ggml_cann_mul_mat_id_fp(ctx, dst);
             break;
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_1:
             ggml_cann_mul_mat_id_quant(ctx, dst);
             break;
         default:

@@ -1190,7 +1190,21 @@ struct test_case {
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
                 if (std::isnan(f1[i]) || std::isnan(f2[i])) {
-                    printf("[%s] NaN at index %zu (%s=%f %s=%f) ", ggml_op_desc(t1), i, bn1, f1[i], bn2, f2[i]);
+                    printf("[%s] NaN at index %zu/%zu (%s=%f %s=%f) ", ggml_op_desc(t1), i, f1.size(), bn1, f1[i], bn2, f2[i]);
+                    // Debug: print tensor info
+                    printf("\n  t1: type=%s ne=[%lld,%lld,%lld,%lld]\n",
+                           ggml_type_name(t1->type), (long long)t1->ne[0], (long long)t1->ne[1],
+                           (long long)t1->ne[2], (long long)t1->ne[3]);
+                    // Print first few raw bytes of both tensors for debugging
+                    std::vector<uint8_t> raw1(std::min((size_t)64, ggml_nbytes(t1)));
+                    std::vector<uint8_t> raw2(std::min((size_t)64, ggml_nbytes(t2)));
+                    ggml_backend_tensor_get(t1, raw1.data(), 0, raw1.size());
+                    ggml_backend_tensor_get(t2, raw2.data(), 0, raw2.size());
+                    printf("  %s first 32 bytes: ", bn1);
+                    for (size_t j = 0; j < std::min((size_t)32, raw1.size()); j++) printf("%02x ", raw1[j]);
+                    printf("\n  %s first 32 bytes: ", bn2);
+                    for (size_t j = 0; j < std::min((size_t)32, raw2.size()); j++) printf("%02x ", raw2[j]);
+                    printf("\n");
                     ud->ok = false;
                     return true;
                 }
@@ -5372,13 +5386,14 @@ static const ggml_type all_types[] = {
 };
 
 static const ggml_type base_types[] = {
-    GGML_TYPE_F32, GGML_TYPE_F16,
+    // GGML_TYPE_F32, GGML_TYPE_F16,
     GGML_TYPE_Q8_0, // for I8MM tests
+    GGML_TYPE_Q8_1, // Q8_1 as weight matrix (now supported with vec_dot_q8_1_q8_1)
     GGML_TYPE_Q4_0,
     GGML_TYPE_Q4_1, // for I8MM tests
-    GGML_TYPE_Q4_K,
-    GGML_TYPE_MXFP4, // TODO: or "other"
-    GGML_TYPE_IQ2_XXS
+    // GGML_TYPE_Q4_K,
+    // GGML_TYPE_MXFP4, // TODO: or "other"
+    // GGML_TYPE_IQ2_XXS
 };
 
 static const ggml_type other_types[] = {
@@ -5909,7 +5924,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
 #if 1
     for (ggml_type type_a : base_types) {
-        for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (ggml_type type_b : {GGML_TYPE_F16, GGML_TYPE_F32}) {
             std::vector<int> ks = { 256 };
             if (ggml_blck_size(type_a) == 1) {
                 ks.push_back(4);

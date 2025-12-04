@@ -47,6 +47,21 @@
 
 #define GGML_CANN_NAME "CANN"
 
+// Debug macros for Q4_1/Q8_1 transform functions.
+// Uncomment the following lines to enable debug output:
+#define DEBUG_Q4_1_TRANSFORM
+// #define DEBUG_Q8_1_TRANSFORM
+//
+// When enabled, these will print:
+// - Structure sizes (block_q4_1, block_q8_1, ggml_half, ggml_half2)
+// - Number of elements and groups being processed
+// - First 3 groups' d/m/s values in both hex and float formats
+//
+// This helps diagnose issues with:
+// - Incorrect memory layout assumptions
+// - Endianness problems
+// - Anonymous struct/union member access in C++
+
 /**
  * @brief Handles CANN errors by printing an error message and aborting.
  *
@@ -1012,6 +1027,315 @@ static void ggml_backend_cann_transform_back_q8_0(
     }
 }
 
+static inline float fp16_to_fp32(uint16_t h) {
+    // Generic fp16 to fp32 conversion
+    uint32_t sign = (h & 0x8000) << 16;
+    uint32_t exp  = (h & 0x7C00) >> 10;
+    uint32_t mant = (h & 0x03FF);
+    uint32_t f;
+
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign;
+        } else {
+            // subnormal
+            float m = mant / 1024.0f;
+            float v = ldexpf(m, -14);
+            memcpy(&f, &v, 4);
+            f |= sign;
+        }
+    } else if (exp == 31) {
+        f = sign | 0x7F800000 | (mant << 13);
+    } else {
+        uint32_t e = exp - 15 + 127;
+        f = sign | (e << 23) | (mant << 13);
+    }
+    return *(float*)&f;
+}
+
+/*
+    q4_1 -> q4_0 pre-conversion:
+
+    Input:
+        src: q4_1 blocks
+        dst: intermediate buffer (compatible with q4_0 transform_back)
+             format: [packed quant][uint16_t scales...]
+
+    tensor->nelements must be divisible by 32
+*/
+void ggml_backend_cann_transform_pre_q4_1_to_q4_0(
+    const ggml_tensor * tensor, const void * src, void * dst)
+{
+    int64_t n_elems = ggml_nelements(tensor);
+    int64_t groups = n_elems / QK4_0;
+
+    block_q4_1 * b1 = (block_q4_1 *)src;
+
+    // q4_0 intermediate storage format:
+    //   first half is packed 4-bit (2 values per byte)
+    //   second half is uint16_t scale
+    uint8_t  * quant = (uint8_t *)dst;
+    uint16_t * scales = (uint16_t *)(quant + n_elems/2);
+
+    for (int g = 0; g < groups; g++) {
+        block_q4_1 * blk = &b1[g];
+
+        float d = fp16_to_fp32(blk->d);
+        float m = fp16_to_fp32(blk->m);
+
+        // decode q4_1 block
+        float vals[QK4_0];
+        for (int i = 0; i < QK4_0; i++) {
+            uint8_t q = blk->qs[i];
+            float v = d * (q - 8) + m;
+            vals[i] = v - m;   // remove mean for q4_0 (no bias)
+        }
+
+        // calculate q4_0 scale
+        float max_abs = 0.0f;
+        for (int i = 0; i < QK4_0; i++) {
+            float a = fabsf(vals[i]);
+            if (a > max_abs) max_abs = a;
+        }
+
+        float d0 = (max_abs > 0) ? (max_abs / 7.0f) : 1.0f;
+        scales[g] = (uint16_t)(d0 * 256.0f);   // encode scale as q4_0 format
+
+        // re-quantize to 0~15
+        uint8_t qs_q4_0[QK4_0];
+        for (int i = 0; i < QK4_0; i++) {
+            float q = vals[i] / d0;
+            int qi = (int)roundf(q + 8); // shift to unsigned
+            if (qi < 0) qi = 0;
+            if (qi > 15) qi = 15;
+            qs_q4_0[i] = (uint8_t)qi;
+        }
+
+        // pack into two 4-bit
+        uint8_t * qdst = quant + g * (QK4_0/2);
+        for (int i = 0; i < QK4_0; i += 2) {
+            qdst[i/2] = (qs_q4_0[i]) | (qs_q4_0[i+1] << 4);
+        }
+    }
+}
+/**
+ * @brief Transform quantized Q4.1 tensor data into a format suitable for CANN
+ * processing.
+ *
+ * This function transforms quantized Q4.1 tensor data into a format suitable
+ * for CANN processing. It extracts quantization values, scales (d), and min
+ * values (m) from the source data and organizes them as: [all qs][all d][all m].
+ *
+ * @param tensor Pointer to the tensor information.
+ * @param src Pointer to the source data in Q4.1 format.
+ * @param dst Pointer to the destination buffer where transformed data will be
+ * stored.
+ */
+static void ggml_backend_cann_transform_q4_1(
+    ggml_tensor* tensor,
+    const void* src,
+    void* dst) {
+
+    int64_t n_elems = ggml_nelements(tensor);
+    int64_t groups = n_elems / QK4_1;
+    size_t quant_bytes = n_elems / 2;
+
+    uint8_t* quant_offset = (uint8_t*)dst;
+    uint16_t* scale_offset = (uint16_t*)((char*)dst + quant_bytes);
+    uint16_t* mean_offset  = scale_offset + groups;
+
+    for (int g = 0; g < groups; g++) {
+
+        const block_q4_1* b =
+            (const block_q4_1*)((const char*)src + g * sizeof(block_q4_1));
+
+        // scale & mean stored after quant_bytes
+        *scale_offset++ = GGML_FP16_TO_FP32(b->d);
+        *mean_offset++  = GGML_FP16_TO_FP32(b->m);
+
+        // pack 32×4bit → 16 bytes
+        const uint8_t* qs = b->qs;
+
+        // 0-15
+        for (int j = 0; j < QK4_1/2; j += 2) {
+            uint8_t q0 = qs[j]     & 0x0F;
+            uint8_t q1 = qs[j + 1] & 0x0F;
+            *quant_offset++ = (q1 << 4) | q0;
+        }
+
+        // 16-31
+        for (int j = 0; j < QK4_1/2; j += 2) {
+            uint8_t q0 = (qs[j]     >> 4) & 0x0F;
+            uint8_t q1 = (qs[j + 1] >> 4) & 0x0F;
+            *quant_offset++ = (q1 << 4) | q0;
+        }
+    }
+
+    // XOR like q4_0
+    for (uint8_t* p = (uint8_t*)dst;
+         p < (uint8_t*)dst + quant_bytes; p++) {
+        *p ^= 0x88;
+    }
+}
+
+
+/**
+ * @brief Transform CANN processed data back into quantized Q4.1 format.
+ *
+ * This function transforms CANN processed data back into quantized Q4.1 format.
+ * It reverses the transformation performed by
+ * ggml_backend_cann_transform_q4_1(), converting the data back into its
+ * original quantized form.
+ *
+ * @param tensor Pointer to the tensor information.
+ * @param src Pointer to the source buffer containing transformed data.
+ * @param dst Pointer to the destination buffer where the Q4.1 formatted data
+ * will be stored.
+ */
+static void ggml_backend_cann_transform_back_q4_1(
+    const ggml_tensor* tensor,
+    void* src,
+    void* dst) {
+
+    int64_t n_elems = ggml_nelements(tensor);
+    int64_t groups = n_elems / QK4_1;
+    size_t quant_bytes = n_elems / 2;
+
+    uint8_t* quant_offset = (uint8_t*)src;
+
+    uint16_t* scale_offset =
+        (uint16_t*)((char*)src + quant_bytes);
+
+    uint16_t* mean_offset =
+        scale_offset + groups;
+
+    // undo XOR
+    for (uint8_t* p = quant_offset;
+         p < quant_offset + quant_bytes; p++) {
+        *p ^= 0x88;
+    }
+
+    // reset for reading
+    quant_offset = (uint8_t*)src;
+
+    for (int g = 0; g < groups; g++) {
+
+        block_q4_1* b =
+            (block_q4_1*)((char*)dst + g * sizeof(block_q4_1));
+
+        b->d = GGML_FP32_TO_FP16(*(scale_offset++));
+        b->m = GGML_FP32_TO_FP16(*(mean_offset++));
+
+        uint8_t* qs = b->qs;
+
+        // unpack front 16 bytes
+        for (int j = 0; j < QK4_1/2; j += 2) {
+            uint8_t v = *quant_offset++;
+            qs[j]     =  v & 0x0F;
+            qs[j+1]   = (v >> 4);
+        }
+
+        // unpack later 16 bytes
+        for (int j = 0; j < QK4_1/2; j += 2) {
+            uint8_t v = *quant_offset++;
+            qs[j]     |= (v << 4);
+            qs[j+1]   |= (v & 0xF0);
+        }
+    }
+}
+
+
+/**
+ * @brief Transform quantized Q8.1 tensor data into a format suitable for CANN
+ * processing.
+ *
+ * This function transforms quantized Q8.1 tensor data into a format suitable
+ * for CANN processing. It extracts quantization values, scales (d), and sum
+ * values (s) from the source data and organizes them as: [all qs][all d][all s].
+ *
+ * @param tensor Pointer to the tensor information.
+ * @param src Pointer to the source data in Q8.1 format.
+ * @param dst Pointer to the destination buffer where transformed data will be
+ * stored.
+ */
+static void ggml_backend_cann_transform_q8_1(ggml_tensor* tensor,
+                                             const void* src,
+                                             void* dst) {
+    // Q8_1 has: d (scale), s (sum), qs[32] (int8 quants)
+    // For CANN matrix multiplication, we only need d and qs (like Q8_0).
+    // The s value is used for dot product optimization but not needed here.
+    // 
+    // Q8_1 dequantization: value = qs[i] * d (qs is already signed int8)
+    // No offset needed since int8 is already centered around 0.
+    //
+    // Data layout after transform: [all qs][all d][all s]
+    // We still copy s to maintain the same total size as original data,
+    // even though s is not used in matrix multiplication.
+    
+    int64_t n_elems = ggml_nelements(tensor);
+    int64_t groups = n_elems / QK8_1;
+    size_t quant_bytes = n_elems * sizeof(uint8_t);
+
+    uint8_t* quant_offset = (uint8_t*)dst;
+    uint16_t* scale_d_offset = (uint16_t*)((char*)dst + quant_bytes);
+    uint16_t* scale_s_offset = scale_d_offset + groups;  // s comes after all d values
+
+    for (int i = 0; i < groups; i++) {
+        const block_q8_1* group =
+            (const block_q8_1*)((const char*)src + i * sizeof(block_q8_1));
+        
+        // Copy both d and s to maintain data size
+        const uint16_t* ds_ptr = (const uint16_t*)group;
+        *scale_d_offset = ds_ptr[0];  // d is at offset 0
+        *scale_s_offset = ds_ptr[1];  // s is at offset 1
+        scale_d_offset++;
+        scale_s_offset++;
+        
+        size_t group_quant_size = QK8_1 * sizeof(uint8_t);
+        memcpy(quant_offset, group->qs, group_quant_size);
+        quant_offset += group_quant_size;
+    }
+}
+
+/**
+ * @brief Transform CANN processed data back into quantized Q8.1 format.
+ *
+ * This function transforms CANN processed data back into quantized Q8.1 format.
+ * It reverses the transformation performed by
+ * ggml_backend_cann_transform_q8_1(), converting the data back into its
+ * original quantized form.
+ *
+ * @param tensor Pointer to the tensor information.
+ * @param src Pointer to the source buffer containing transformed data.
+ * @param dst Pointer to the destination buffer where the Q8.1 formatted data
+ * will be stored.
+ */
+static void ggml_backend_cann_transform_back_q8_1(
+    const ggml_tensor* tensor, const void* src, void* dst) {
+    // Reverse transform: restore d, s, and qs from [all qs][all d][all s] layout
+    
+    int64_t n_elems = ggml_nelements(tensor);
+    int64_t groups = n_elems / QK8_1;
+    size_t quant_bytes = n_elems * sizeof(uint8_t);
+
+    const uint8_t* quant_offset = (const uint8_t*)src;
+    const uint16_t* scale_d_offset = (const uint16_t*)((const char*)src + quant_bytes);
+    const uint16_t* scale_s_offset = scale_d_offset + groups;
+
+    for (int i = 0; i < groups; i++) {
+        block_q8_1* group = (block_q8_1*)((char*)dst + i * sizeof(block_q8_1));
+        // Use pointer arithmetic to safely write d and s to the union
+        uint16_t* ds_ptr = (uint16_t*)group;
+        ds_ptr[0] = *scale_d_offset;  // d is at offset 0
+        ds_ptr[1] = *scale_s_offset;  // s is at offset 1
+        scale_d_offset++;
+        scale_s_offset++;
+        size_t group_quant_size = QK8_1 * sizeof(uint8_t);
+        memcpy(group->qs, quant_offset, group_quant_size);
+        quant_offset += group_quant_size;
+    }
+}
+
 /**
  * @brief Transform tensor data based on its type for CANN processing.
  *
@@ -1030,8 +1354,14 @@ static void ggml_backend_cann_transform(ggml_tensor* tensor,
         case GGML_TYPE_Q4_0:
             ggml_backend_cann_transform_q4_0(tensor, src, dst);
             break;
+        case GGML_TYPE_Q4_1:
+            ggml_backend_cann_transform_q4_1(tensor, src, dst);
+            break;
         case GGML_TYPE_Q8_0:
             ggml_backend_cann_transform_q8_0(tensor, src, dst);
+            break;
+        case GGML_TYPE_Q8_1:
+            ggml_backend_cann_transform_q8_1(tensor, src, dst);
             break;
         default:
             break;
@@ -1056,8 +1386,14 @@ static void ggml_backend_cann_transform_back(
         case GGML_TYPE_Q4_0:
             ggml_backend_cann_transform_back_q4_0(tensor, src, dst);
             break;
+        case GGML_TYPE_Q4_1:
+            ggml_backend_cann_transform_back_q4_1(tensor, src, dst);
+            break;
         case GGML_TYPE_Q8_0:
             ggml_backend_cann_transform_back_q8_0(tensor, src, dst);
+            break;
+        case GGML_TYPE_Q8_1:
+            ggml_backend_cann_transform_back_q8_1(tensor, src, dst);
             break;
         default:
             break;
@@ -1076,7 +1412,9 @@ static void ggml_backend_cann_transform_back(
 static bool need_transform(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_1:
             return true;
         default:
             return false;
@@ -2333,36 +2671,70 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev,
                 case GGML_TYPE_F16:
                 case GGML_TYPE_F32:
                     return true;
-                case GGML_TYPE_Q8_0:
                 case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q8_1:
 #ifdef ASCEND_310P
-                    // Q4 && Q8 per group is not suppor on 310p device
+                    // Q4 && Q8 per group is not supported on 310p device
                     return false;
 #endif
-                    // only support contiguous for quantized types.
-                    return ggml_is_contiguous(op->src[0]) &&
-                            ggml_is_contiguous(op->src[1]);
+                    {
+                        // only support contiguous for quantized types.
+                        bool src0_contig = ggml_is_contiguous(op->src[0]);
+                        bool src1_contig = ggml_is_contiguous(op->src[1]);
+                        return src0_contig && src1_contig;
+                    }
                 default:
                     return false;
             }
         }
-        case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_ID: {
+            // Debug output (reuse debug_enabled from MUL_MAT)
+            static int debug_enabled = -1;
+            if (debug_enabled == -1) {
+                debug_enabled = getenv("CANN_DEBUG_SUPPORTS_OP") != nullptr ? 1 : 0;
+            }
+            
             switch (op->src[0]->type) {
                 case GGML_TYPE_F16:
                 case GGML_TYPE_F32:
                     return true;
-                case GGML_TYPE_Q8_0:
                 case GGML_TYPE_Q4_0:
+                case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q8_0:
+                case GGML_TYPE_Q8_1:
 #ifdef ASCEND_310P
                     // Q4 && Q8 per group is not suppor on 310p device
+                    if (debug_enabled) {
+                        fprintf(stderr, "[CANN] MUL_MAT_ID type=%s: REJECTED (ASCEND_310P)\n", 
+                                ggml_type_name(op->src[0]->type));
+                    }
                     return false;
 #endif
-                    // only support contiguous for quantized types.
-                    return ggml_is_contiguous(op->src[0]) &&
-                            ggml_is_contiguous(op->src[1]);
+                    {
+                        // only support contiguous for quantized types.
+                        bool src0_contig = ggml_is_contiguous(op->src[0]);
+                        bool src1_contig = ggml_is_contiguous(op->src[1]);
+                        bool result = src0_contig && src1_contig;
+                        
+                        if (debug_enabled) {
+                            fprintf(stderr, "[CANN] MUL_MAT_ID type=%s src0_contig=%d src1_contig=%d => %s\n",
+                                    ggml_type_name(op->src[0]->type),
+                                    src0_contig, src1_contig,
+                                    result ? "SUPPORTED" : "NOT_SUPPORTED");
+                        }
+                        
+                        return result;
+                    }
                 default:
+                    if (debug_enabled) {
+                        fprintf(stderr, "[CANN] MUL_MAT_ID type=%s: UNSUPPORTED_TYPE\n", 
+                                ggml_type_name(op->src[0]->type));
+                    }
                     return false;
             }
+        }
         // embedding
         case GGML_OP_GET_ROWS: {
             switch (op->src[0]->type) {
