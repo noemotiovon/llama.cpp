@@ -331,3 +331,11 @@ Enable ACL graph execution during the prefill stage, default is false. This opti
 ### GGML_CANN_OPERATOR_FUSION
 
 Enable operator fusion during computation, default is false. This option fuses compatible operators (e.g., ADD + RMS_NORM) to reduce overhead and improve performance.
+
+### GGML_CANN_MULTI_STREAM
+
+Enables multi-stream execution for parallel processing of operations. When enabled, operations can be distributed across multiple streams to improve performance. Default is false (disabled).
+
+### GGML_CANN_NUM_STREAMS
+
+Specifies the number of streams to use for multi-stream execution. This option is only effective when `GGML_CANN_MULTI_STREAM` is enabled. Default is 4, maximum is 8.

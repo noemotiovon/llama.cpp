@@ -32,6 +32,7 @@
 #include <aclnnop/aclnn_trans_matmul_weight.h>
 #include <stdarg.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -40,6 +41,8 @@
 #include <optional>
 #include <queue>
 #include <unordered_set>
+#include <unordered_map>
+#include <vector>
 
 #define GGML_COMMON_DECL_C
 
@@ -76,13 +79,13 @@ thread_local int g_current_cann_device = -1;
  * @param device The target device ID to set.
  */
 void ggml_cann_set_device(const int32_t device) {
-    // int current_device = -1;
+    int current_device = -1;
     // Note: In some CANN versions, if no device has been set yet,
     //       aclrtGetDevice(&current_device) may return 0 by default.
-    // aclrtGetDevice(&current_device);
+    aclrtGetDevice(&current_device);
 
     // If the current device is already the target one, no need to switch.
-    if (device == g_current_cann_device) {
+    if (device == current_device) {
         return;
     }
 
@@ -2068,14 +2071,221 @@ static bool ggml_backend_cann_cpy_tensor_async(ggml_backend_t      backend_src,
  * @brief Synchronizes a CANN backend.
  *
  * This function synchronizes the specified CANN backend by waiting for all
- * operations in its associated stream to complete.
+ * operations in its associated streams to complete. When multi-stream execution
+ * is enabled, it synchronizes all active streams.
  *
  * @param backend Pointer to the CANN backend structure to synchronize.
  */
 static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
     ggml_cann_set_device(cann_ctx->device);
-    ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
+    
+    // Synchronize all active streams when multi-stream is enabled
+    if (cann_ctx->multi_stream_enabled) {
+        for (int i = 0; i < cann_ctx->num_streams; ++i) {
+            if (cann_ctx->streams[i] != nullptr) {
+                ACL_CHECK(aclrtSynchronizeStream(cann_ctx->streams[i]));
+            }
+        }
+    } else {
+        ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
+    }
+}
+
+/**
+ * @brief Check if a tensor operation is an empty/view operation that doesn't do computation.
+ *
+ * @param node The tensor node to check.
+ * @return true if the node is empty or a view operation, false otherwise.
+ */
+ static bool ggml_cann_is_empty_op(const ggml_tensor * node) {
+    return node->op == GGML_OP_NONE ||
+           node->op == GGML_OP_RESHAPE ||
+           node->op == GGML_OP_TRANSPOSE ||
+           node->op == GGML_OP_VIEW ||
+           node->op == GGML_OP_PERMUTE;
+}
+
+/**
+ * @brief Check if dst tensor depends on src tensor.
+ *
+ * @param dst The destination tensor to check.
+ * @param src The source tensor to check.
+ * @return true if dst depends on src, false otherwise.
+ */
+static bool ggml_cann_is_src_of(const ggml_tensor * dst, const ggml_tensor * src) {
+    // Check direct source dependency
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        if (dst->src[s] == src) {
+            return true;
+        }
+    }
+    // Check implicit dependency if they view the same tensor
+    const ggml_tensor * dst2 = dst->view_src ? dst->view_src : dst;
+    const ggml_tensor * src2 = src->view_src ? src->view_src : src;
+    if (dst2 == src2) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief Check if a node's dependencies are satisfied.
+ * A node's dependencies are satisfied if all its source tensors are either:
+ * 1. Already in new_order (used[src_idx] == true), or
+ * 2. In the current_set being built
+ *
+ * @param node The node to check.
+ * @param graph The computation graph.
+ * @param used Array indicating which nodes have been processed.
+ * @param current_set The current set of nodes being built.
+ * @return true if all dependencies are satisfied, false otherwise.
+ */
+static bool ggml_cann_dependencies_satisfied(const ggml_tensor * node,
+                                               struct ggml_cgraph * graph,
+                                               const std::vector<bool> & used,
+                                               const std::vector<int> & current_set) {
+    // Check all direct source dependencies
+    for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        const ggml_tensor * src = node->src[s];
+        if (src == nullptr) {
+            continue;
+        }
+        
+        // Find the index of src in the graph
+        int src_idx = -1;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            if (graph->nodes[i] == src) {
+                src_idx = i;
+                break;
+            }
+        }
+        
+        // If src is not a node in the graph (e.g., it's a leaf/input), dependency is satisfied
+        if (src_idx == -1) {
+            continue;
+        }
+        
+        // Check if src has been processed (in new_order)
+        if (used[src_idx]) {
+            continue; // Dependency satisfied
+        }
+        
+        // Check if src is in current_set
+        bool src_in_current_set = std::find(current_set.begin(), current_set.end(), src_idx) != current_set.end();
+        if (!src_in_current_set) {
+            return false; // Dependency not satisfied
+        }
+    }
+    
+    // Check view_src dependency if exists
+    if (node->view_src) {
+        const ggml_tensor * view_src = node->view_src;
+        int view_src_idx = -1;
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            if (graph->nodes[i] == view_src) {
+                view_src_idx = i;
+                break;
+            }
+        }
+        
+        if (view_src_idx != -1) {
+            if (!used[view_src_idx]) {
+                bool view_src_in_current_set = std::find(current_set.begin(), current_set.end(), view_src_idx) != current_set.end();
+                if (!view_src_in_current_set) {
+                    return false; // Dependency not satisfied
+                }
+            }
+        }
+    }
+    
+    return true; // All dependencies satisfied
+}
+
+/**
+ * @brief Optimize the graph to allow more parallel execution.
+ *
+ * @param backend The CANN backend.
+ * @param graph The computation graph to optimize.
+ */
+static void ggml_cann_optimize_graph(ggml_backend_cann_context * cann_ctx, struct ggml_cgraph * graph) {
+    static bool disable_optimize_graph = parse_bool(get_env_as_lowercase("GGML_CANN_DISABLE_OPTIMIZE_GRAPH").value_or(""));
+    if (disable_optimize_graph) {
+        return;
+    }
+
+    int num_small_nodes = 0;
+    int num_counted_nodes = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (!ggml_cann_is_empty_op(graph->nodes[i]) &&
+            graph->nodes[i]->op != GGML_OP_SET_ROWS) {
+            if (ggml_nrows(graph->nodes[i]) <= 8) {
+                num_small_nodes++;
+            }
+            num_counted_nodes++;
+        }
+    }
+    if (num_small_nodes < num_counted_nodes / 2) {
+        return;
+    }
+
+    std::vector<ggml_tensor *> new_order;
+    std::vector<bool> used(graph->n_nodes, false);
+    int first_unused = 0;
+
+    while (first_unused < graph->n_nodes) {
+        std::vector<int> current_set;
+
+        current_set.push_back(first_unused);
+
+        const int NUM_TO_CHECK = 20;
+        for (int j = first_unused + 1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
+            if (used[j]) {
+                continue;
+            }
+            if (ggml_cann_is_empty_op(graph->nodes[j])) {
+                continue;
+            }
+            // Check if all dependencies of node j are satisfied
+            bool ok = ggml_cann_dependencies_satisfied(graph->nodes[j], graph, used, current_set);
+            
+            if (ok) {
+                current_set.push_back(j);
+            }
+        }
+
+        if (graph->nodes[current_set.back()]->op != GGML_OP_ADD) {
+            for (int j = first_unused + 1; j < std::min(first_unused + NUM_TO_CHECK, graph->n_nodes); ++j) {
+                if (used[j]) {
+                    continue;
+                }
+                if (!ggml_cann_is_empty_op(graph->nodes[j])) {
+                    continue;
+                }
+                // Check if all dependencies of view node j are satisfied
+                bool ok = ggml_cann_dependencies_satisfied(graph->nodes[j], graph, used, current_set);
+                if (ok) {
+                    current_set.push_back(j);
+                }
+            }
+        }
+
+        // Push the current set into new_order
+        for (auto c : current_set) {
+            new_order.push_back(graph->nodes[c]);
+            used[c] = true;
+        }
+        while (first_unused < graph->n_nodes && used[first_unused]) {
+            first_unused++;
+        }
+    }
+
+    // Replace the graph with the new order
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        graph->nodes[i] = new_order[i];
+    }
+
+    GGML_UNUSED(cann_ctx);
 }
 
 /**
@@ -2139,6 +2349,87 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
     static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
 
     if (!use_cann_graph || cann_graph_capture_required) {
+        // if (cann_ctx->multi_stream_enabled && cann_ctx->num_streams > 1) {
+        //     std::unordered_map<const ggml_tensor*, int> tensor_stream_map;
+        //     int current_stream = 0;
+        //     int nodes_in_current_batch = 0;
+        //     const int batch_size = 4; 
+        //     for (int i = 0; i < cgraph->n_nodes; i++) {
+        //         ggml_tensor * node = cgraph->nodes[i];
+
+        //         if (ggml_is_empty(node) || ggml_cann_is_empty_op(node)) {
+        //             continue;
+        //         }
+
+        //         int max_src_stream = -1;
+        //         for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        //             if (node->src[s] != nullptr) {
+        //                 const ggml_tensor* src = node->src[s]->view_src ? node->src[s]->view_src : node->src[s];
+        //                 auto it = tensor_stream_map.find(src);
+        //                 if (it != tensor_stream_map.end()) {
+        //                     max_src_stream = std::max(max_src_stream, it->second);
+        //                 }
+        //             }
+        //         }
+
+        //         int target_stream;
+        //         if (max_src_stream >= 0) {
+        //             target_stream = max_src_stream;
+        //         } else {
+        //             target_stream = current_stream;
+        //             nodes_in_current_batch++;
+        //             if (nodes_in_current_batch >= batch_size) {
+        //                 current_stream = (current_stream + 1) % cann_ctx->num_streams;
+        //                 nodes_in_current_batch = 0;
+        //             }
+        //         }
+
+        //         for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        //             if (node->src[s] != nullptr) {
+        //                 const ggml_tensor* src = node->src[s]->view_src ? node->src[s]->view_src : node->src[s];
+        //                 auto it = tensor_stream_map.find(src);
+        //                 if (it != tensor_stream_map.end() && it->second != target_stream) {
+        //                     aclrtEvent event = cann_ctx->get_stream_event(it->second);
+        //                     ACL_CHECK(aclrtRecordEvent(event, cann_ctx->stream(it->second)));
+        //                     ACL_CHECK(aclrtStreamWaitEvent(cann_ctx->stream(target_stream), event));
+        //                 }
+        //             }
+        //         }
+
+        //         cann_ctx->set_current_stream(target_stream);
+        //         bool ok = ggml_cann_compute_forward(*cann_ctx, node);
+        //         if (!ok) {
+        //             GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+        //         }
+        //         GGML_ASSERT(ok);
+
+        //         const ggml_tensor* out_tensor = node->view_src ? node->view_src : node;
+        //         tensor_stream_map[out_tensor] = target_stream;
+        //     }
+        //     for (int s = 0; s < cann_ctx->num_streams; ++s) {
+        //         if (cann_ctx->streams[s] != nullptr) {
+        //             aclrtEvent event = cann_ctx->get_stream_event(s);
+        //             ACL_CHECK(aclrtRecordEvent(event, cann_ctx->stream(s)));
+        //             if (s != 0) {
+        //                 ACL_CHECK(aclrtStreamWaitEvent(cann_ctx->stream(0), event));
+        //             }
+        //         }
+        //     }
+        //     cann_ctx->set_current_stream(0);
+        // } else {
+        //     for (int i = 0; i < cgraph->n_nodes; i++) {
+        //         ggml_tensor * node = cgraph->nodes[i];
+
+        //         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+        //             continue;
+        //         }
+
+        //         bool ok = ggml_cann_compute_forward(*cann_ctx, node);
+        //         if (!ok) {
+        //             GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+        //         }
+        //         GGML_ASSERT(ok);
+        //     }
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
             if (opt_fusion) {
@@ -2193,6 +2484,7 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend, 
     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
     ggml_cann_set_device(cann_ctx->device);
     g_nz_workspaces[cann_ctx->device].clear();
+    ggml_cann_optimize_graph(cann_ctx, cgraph);
 
     // calculate rope cache for fist layer in current device.
     cann_ctx->rope_cache.cached = false;
@@ -2892,6 +3184,7 @@ void ggml_backend_cann_get_device_description(int32_t device, char * description
 }
 
 void ggml_backend_cann_get_device_memory(int32_t device, size_t * free, size_t * total) {
+    std::cout << "ggml_backend_cann_get_device_memory: device = " << device << std::endl;
     ggml_cann_set_device(device);
     ACL_CHECK(aclrtGetMemInfo(ACL_HBM_MEM, free, total));
 }

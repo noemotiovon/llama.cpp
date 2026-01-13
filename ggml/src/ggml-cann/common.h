@@ -382,7 +382,7 @@ struct ggml_cann_graph_lru_cache {
 
     std::list<ggml_cann_graph *> cache_list; /**< List storing cached graphs as raw pointers. */
 
-    ggml_cann_graph_lru_cache() { capacity = parse_integer(get_env("GGML_CANN_GRAPH_CACHE_CAPACITY").value_or("12")); }
+    ggml_cann_graph_lru_cache() { capacity = parse_integer(get_env_as_lowercase("GGML_CANN_GRAPH_CACHE_CAPACITY").value_or("12")); }
 
     /**
      * @brief Push a new graph to the front of the cache.
@@ -564,6 +564,10 @@ struct ggml_backend_cann_context {
     ggml_cann_tensor_cache rms_norm_zero_tensor_cache;
 
     aclrtStream streams[GGML_CANN_MAX_STREAMS] = { nullptr }; /**< Array of streams for the device. */
+    bool multi_stream_enabled;       /**< Whether multi-stream execution is enabled. */
+    int num_streams;                 /**< Number of streams to use for parallel execution. */
+    aclrtEvent stream_events[GGML_CANN_MAX_STREAMS] = {nullptr}; /**< Events for stream synchronization. */
+    int current_stream_idx = 0; /**< Index of the current active stream for multi-stream execution. */
 
     /**
      * @brief Constructor for initializing the context with a given device.
@@ -573,8 +577,16 @@ struct ggml_backend_cann_context {
         ggml_cann_set_device(device);
         description = aclrtGetSocName();
 
+        multi_stream_enabled = parse_bool(get_env_as_lowercase("GGML_CANN_MULTI_STREAM").value_or(""));
+        num_streams = parse_integer(get_env_as_lowercase("GGML_CANN_NUM_STREAMS").value_or("4"));
+        num_streams = std::min(num_streams, GGML_CANN_MAX_STREAMS);
+        if (multi_stream_enabled) {
+            GGML_LOG_INFO("%s: device %d multi-stream execution is ON with %d streams\n", __func__,
+                device, num_streams);
+        }
+
 #ifdef USE_ACL_GRAPH
-        acl_graph_mode = parse_bool(get_env("GGML_CANN_ACL_GRAPH").value_or("on"));
+        acl_graph_mode = parse_bool(get_env_as_lowercase("GGML_CANN_ACL_GRAPH").value_or("on"));
         GGML_LOG_INFO("%s: device %d execution mode is %s (%s)\n", __func__, device, acl_graph_mode ? "GRAPH" : "EAGER",
                       acl_graph_mode ? "acl graph enabled" : "acl graph disabled");
 #endif
@@ -588,34 +600,59 @@ struct ggml_backend_cann_context {
         if (copy_event != nullptr) {
             ACL_CHECK(aclrtDestroyEvent(copy_event));
         }
+
         for (int i = 0; i < GGML_CANN_MAX_STREAMS; ++i) {
             if (streams[i] != nullptr) {
                 ACL_CHECK(aclrtDestroyStream(streams[i]));
+            }
+            if (stream_events[i] != nullptr) {
+                ACL_CHECK(aclrtDestroyEvent(stream_events[i]));
             }
         }
     }
 
     /**
      * @brief Get or create a stream for a given index.
-     * @param stream Index of the stream.
+     * @param stream_idx Index of the stream.
      * @return The stream corresponding to the given index.
      */
-    aclrtStream stream(int stream) {
-        if (streams[stream] == nullptr) {
+    aclrtStream stream(int stream_idx) {
+        if (streams[stream_idx] == nullptr) {
             // If the device is not set here, destroying the stream later may cause a mismatch
             // between the thread contexts where the stream was created and destroyed.
             // However, I printed the device_id, thread_id, and stream, and they are all consistent.
             ACL_CHECK(aclrtSetDevice(device));
-            ACL_CHECK(aclrtCreateStream(&streams[stream]));
+            ACL_CHECK(aclrtCreateStream(&streams[stream_idx]));
         }
-        return streams[stream];
+        return streams[stream_idx];
     }
 
     /**
-     * @brief Get or create the default stream (index 0).
-     * @return The default stream.
+     * @brief Get or create the current active stream (based on current_stream_idx).
+     * @return The current active stream.
      */
-    aclrtStream stream() { return stream(0); }
+    aclrtStream stream() { return stream(current_stream_idx); }
+
+    /**
+     * @brief Set the current active stream index for multi-stream execution.
+     * @param idx The stream index to set as active.
+     */
+    void set_current_stream(int idx) {
+        current_stream_idx = idx % num_streams;
+    }
+
+    /**
+     * @brief Get or create an event for stream synchronization.
+     * @param stream_idx Index of the stream for which to get the event.
+     * @return The event for the specified stream.
+     */
+    aclrtEvent get_stream_event(int stream_idx) {
+        if (stream_events[stream_idx] == nullptr) {
+            ggml_cann_set_device(device);
+            ACL_CHECK(aclrtCreateEvent(&stream_events[stream_idx]));
+        }
+        return stream_events[stream_idx];
+    }
 
     // TODO: each stream should have a memory pool.
     std::unique_ptr<ggml_cann_pool> mem_pool; /**< Memory pool for the device. */
