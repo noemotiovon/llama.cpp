@@ -32,6 +32,7 @@
 #include <aclnnop/aclnn_trans_matmul_weight.h>
 #include <stdarg.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -39,7 +40,9 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #define GGML_COMMON_DECL_C
 
@@ -2138,19 +2141,91 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
     // With the use of CANN graphs, the execution will be performed by the graph launch.
     static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
 
+    // Reset stream number to main stream (0) at the start
+    cann_ctx->curr_stream_no = 0;
+
+    ggml_cann_stream_context & stream_ctx = cann_ctx->stream_context();
+    bool                         is_concurrent_event_active = false;
+    ggml_cann_concurrent_event * concurrent_event           = nullptr;
+    bool                         should_launch_concurrent_events = false;
+
+    const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
+        if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
+            concurrent_event = &stream_ctx.concurrent_events[node];
+
+            is_concurrent_event_active = true;
+
+            GGML_LOG_DEBUG("Launching %d streams at %s\n", concurrent_event->n_streams, node->name);
+
+            aclrtStream main_stream = cann_ctx->stream();  // this should be stream 0
+            GGML_ASSERT(cann_ctx->curr_stream_no == 0);
+            ACL_CHECK(aclrtRecordEvent(concurrent_event->fork_event, main_stream));
+
+            for (int i = 1; i <= concurrent_event->n_streams; ++i) {
+                aclrtStream stream = cann_ctx->stream(i);
+                ACL_CHECK(aclrtStreamWaitEvent(stream, concurrent_event->fork_event));
+            }
+        }
+    };
+
     if (!use_cann_graph || cann_graph_capture_required) {
+        // Check if we should launch concurrent events
+        if (stream_ctx.concurrent_events.size() > 0) {
+            should_launch_concurrent_events = true;
+            for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
+                should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
+            }
+        }
+
+        int prev_i = -1;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
+            if (is_concurrent_event_active) {
+                GGML_ASSERT(concurrent_event);
+
+                if (node == concurrent_event->join_node) {
+                    cann_ctx->curr_stream_no = 0;
+                    for (int j = 1; j <= concurrent_event->n_streams; ++j) {
+                        // Wait on join events of forked streams in the main stream
+                        ACL_CHECK(aclrtRecordEvent(concurrent_event->join_events[j - 1],
+                                                   cann_ctx->stream(j)));
+                        ACL_CHECK(aclrtStreamWaitEvent(cann_ctx->stream(), concurrent_event->join_events[j - 1]));
+                    }
+
+                    is_concurrent_event_active = false;
+                    concurrent_event           = nullptr;
+                } else {
+                    GGML_ASSERT(concurrent_event->stream_mapping.find(node) != concurrent_event->stream_mapping.end());
+                    cann_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
+                    // Ensure device context is correct for the new stream
+                    ggml_cann_set_device(cann_ctx->device);
+                    GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cann_ctx->curr_stream_no, node->name);
+                }
+            } else if (i - prev_i > 1) {
+                //the previous node was fused
+                const ggml_tensor * prev_node = cgraph->nodes[i - 1];
+                try_launch_concurrent_event(prev_node);
+
+                if (is_concurrent_event_active) {
+                    cann_ctx->curr_stream_no = concurrent_event->stream_mapping[node];
+                    // Ensure device context is correct for the new stream
+                    ggml_cann_set_device(cann_ctx->device);
+                    GGML_LOG_DEBUG("Setting stream no to %d for node %s\n", cann_ctx->curr_stream_no, node->name);
+                }
+            }
+
             if (opt_fusion) {
                 if (ggml_cann_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM })) {
                     ggml_cann_op_add_rms_norm_fused(*cann_ctx, node, cgraph->nodes[i + 1]);
                     i++;
+                    prev_i = i;
                     continue;
                 }
             }
 
             if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
                 node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+                prev_i = i;
                 continue;
             }
 
@@ -2159,6 +2234,11 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
                 GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
             }
             GGML_ASSERT(ok);
+            prev_i = i;
+        }
+
+        if (should_launch_concurrent_events) {
+            stream_ctx.concurrent_events.clear();
         }
     }
 
@@ -2175,6 +2255,251 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
         ACL_CHECK(aclmdlRIExecuteAsync(matched_graph->graph, cann_ctx->stream()));
     }
 #endif  // USE_ACL_GRAPH
+}
+
+/**
+ * @brief Optimizes a computational graph for multi-stream parallel execution in CANN backend.
+ *
+ * This function analyzes the computational graph to identify opportunities for parallel execution
+ * across multiple streams, similar to CUDA's graph optimization. It identifies fork-join patterns
+ * (e.g., QKV attention computation) and reorganizes the graph to enable concurrent execution.
+ *
+ * @param backend Pointer to the CANN backend structure.
+ * @param cgraph Pointer to the computational graph to optimize.
+ */
+static void ggml_backend_cann_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+
+    static bool enable_graph_optimization = [] {
+        const char * env = getenv("GGML_CANN_GRAPH_OPT");
+        return env != nullptr && atoi(env) == 1;
+    }();
+
+    if (!enable_graph_optimization) {
+        return;
+    }
+
+    ggml_cann_stream_context & stream_context = cann_ctx->stream_context();
+    stream_context.reset();
+
+    if (ggml_backend_cann_get_device_count() != 1) {
+        return;
+    }
+
+    // number of out-degrees for a particular node
+    std::unordered_map<const ggml_tensor *, int> fan_out;
+    // reverse mapping of node to index in the cgraph
+    std::unordered_map<const ggml_tensor *, int> node_indices;
+
+    const auto & is_noop = [](const ggml_tensor * node) -> bool {
+        return ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
+               node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
+    };
+
+    const auto & depends_on = [](const ggml_tensor * dst, const ggml_tensor * src) -> bool {
+        for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+            if (dst->src[s] == src) {
+                return true;
+            }
+        }
+        // implicit dependency if they view the same tensor
+        const ggml_tensor * dst2 = dst->view_src ? dst->view_src : dst;
+        const ggml_tensor * src2 = src->view_src ? src->view_src : src;
+        if (dst2 == src2) {
+            return true;
+        }
+        return false;
+    };
+
+    for (int node_idx = 0; node_idx < cgraph->n_nodes; node_idx++) {
+        const ggml_tensor * node = cgraph->nodes[node_idx];
+        node_indices[node]       = node_idx;
+
+        if (is_noop(node)) {
+            continue;
+        }
+        for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
+            const ggml_tensor * src = cgraph->nodes[node_idx]->src[src_idx];
+            //TODO: check why nrows > 1 fails
+            if (node && !is_noop(node) && ggml_nrows(node) <= 1) {
+                fan_out[src] += 1;
+            }
+        }
+    }
+
+    // Target Q, K, V for concurrency
+    // this is a more general way to find nodes which can be candidates for concurrency (although it has not been tested for anything else):
+    // 1. find fan-out (fork) nodes where the same input is used at least N times (in QKV, it would be "attn-norm")
+    // 2. find the join node, where 2 or more of the outputs are required (in QKV, this would "KQ" or "flash-attn")
+    // 3. account for all branches from the fork to the join
+    // 4. To extend lifetimes of the tensors, we interleave the branches (see below for more details)
+    // 5. save the original cgraph and restore it in graph_compute, to enable fusion within streams
+    // See discussion: https://github.com/ggml-org/llama.cpp/pull/16991#issuecomment-3522620030
+
+    const int min_fan_out = 3;
+    const int max_fan_out = 3;
+
+    // store {fork_idx, join_idx}
+    std::vector<std::pair<int, int>> concurrent_node_ranges;
+
+    for (const auto & [root_node, count] : fan_out) {
+        if (count >= min_fan_out && count <= max_fan_out) {
+            const int root_node_idx = node_indices[root_node];
+
+            // only optimize for attn_norm
+            // TODO: make this more generic
+            if (!strstr(root_node->name, "attn_norm")) {
+                continue;
+            }
+
+            bool is_part_of_event = false;
+            for (const auto & [start, end] : concurrent_node_ranges) {
+                if (root_node_idx >= start && root_node_idx <= end) {
+                    is_part_of_event = true;
+                }
+            }
+
+            if (is_part_of_event) {
+                continue;
+            }
+
+            std::vector<std::vector<const ggml_tensor *>> nodes_per_branch;
+            for (int i = root_node_idx + 1; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * node = cgraph->nodes[i];
+                if (!is_noop(node) && depends_on(node, root_node)) {
+                    nodes_per_branch.push_back({ node });
+                }
+            }
+
+            GGML_ASSERT(nodes_per_branch.size() == (size_t) count);
+
+            //find the join point
+            const ggml_tensor * join_node = nullptr;
+
+            const auto & belongs_to_branch = [&](const ggml_tensor *                      node,
+                                                 const std::vector<const ggml_tensor *> & branch) -> bool {
+                for (const ggml_tensor * n : branch) {
+                    if (depends_on(node, n)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            for (int i = root_node_idx + 1; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * curr_node = cgraph->nodes[i];
+
+                int num_joins = 0;
+                for (size_t branch_idx = 0; branch_idx < nodes_per_branch.size(); branch_idx++) {
+                    if (belongs_to_branch(curr_node, nodes_per_branch[branch_idx])) {
+                        num_joins++;
+                    }
+                }
+
+                if (num_joins >= 2) {
+                    join_node = curr_node;
+                    break;
+                }
+
+                bool found_branch = false;
+                for (size_t branch_idx = 0; branch_idx < nodes_per_branch.size(); branch_idx++) {
+                    std::vector<const ggml_tensor *> & branch_vec = nodes_per_branch[branch_idx];
+                    if (belongs_to_branch(curr_node, branch_vec)) {
+                        //continue accumulating
+                        if (std::find(branch_vec.begin(), branch_vec.end(), curr_node) == branch_vec.end()) {
+                            branch_vec.push_back(curr_node);
+                        }
+                        found_branch = true;
+                    }
+                }
+
+                if (!found_branch && is_noop(curr_node)) {
+                    // we can put it in any branch because it will be ignored
+                    nodes_per_branch[0].push_back({ curr_node });
+                }
+            }
+
+            if (join_node) {
+                //Create ggml_cann_concurrent_event
+                ggml_cann_concurrent_event concurrent_event(nodes_per_branch.size());
+                concurrent_event.join_node = join_node;
+
+                for (size_t branch_idx = 0; branch_idx < nodes_per_branch.size(); branch_idx++) {
+                    for (const ggml_tensor * n : nodes_per_branch[branch_idx]) {
+                        concurrent_event.stream_mapping[n] = branch_idx + 1;
+                    }
+                }
+
+                int fork_node_idx = node_indices[root_node];
+                int join_node_idx = node_indices[join_node];
+
+                int       current_branch_idx = 0;
+                int       current_node_idx   = fork_node_idx + 1;
+                const int n_branches         = nodes_per_branch.size();
+
+                int total_branch_nodes = 0;
+                for (std::vector<const ggml_tensor *> branch_nodes : nodes_per_branch) {
+                    total_branch_nodes += branch_nodes.size();
+                }
+
+                // there are other nodes in the middle which are unaccounted for
+                // usually (cpy) nodes, then ignore this fork
+                if (join_node_idx - fork_node_idx - 1 != total_branch_nodes) {
+                    GGML_LOG_DEBUG(
+                        "Skipping %s because the number of nodes in the middle is not equal to the total number of "
+                        "branch nodes %d != %d\n",
+                        root_node->name, join_node_idx - fork_node_idx - 1, total_branch_nodes);
+                    continue;
+                }
+
+                // Save the original order of nodes in this region before interleaving
+                // This is used later to restore grouping for fusion within streams
+                concurrent_event.original_order.reserve(total_branch_nodes);
+                for (int i = fork_node_idx + 1; i < join_node_idx; ++i) {
+                    concurrent_event.original_order.push_back(cgraph->nodes[i]);
+                }
+
+                std::unordered_map<const ggml_tensor *, ggml_cann_concurrent_event> & concurrent_events = cann_ctx->stream_context().concurrent_events;
+                GGML_ASSERT(concurrent_events.find(root_node) == concurrent_events.end());
+                concurrent_events.emplace(root_node, std::move(concurrent_event));
+                GGML_LOG_DEBUG("Adding stream at node %s %p\n", root_node->name, root_node);
+                concurrent_node_ranges.emplace_back(fork_node_idx, join_node_idx);
+
+                // interleave tensors to extend lifetimes so that ggml graph doesn't recycle them
+                // example transformation:
+                // [attn-norm, QMul, QNorm, QRope, KMul, KNorm, KRope, VMul, attn] ->
+                // [attn-norm, QMul, KMul, VMul, QNorm, VNorm, QRope, KRope, attn]
+                while (current_node_idx < join_node_idx) {
+                    std::vector<const ggml_tensor *> & branch_nodes = nodes_per_branch[current_branch_idx];
+
+                    bool has_node = false;
+                    for (std::vector<const ggml_tensor *> branch_node : nodes_per_branch) {
+                        has_node |= branch_node.size() > 0;
+                    }
+
+                    GGML_ASSERT(has_node);
+
+                    if (branch_nodes.empty()) {
+                        current_branch_idx = (current_branch_idx + 1) % n_branches;
+                        continue;
+                    }
+
+                    cgraph->nodes[current_node_idx] = const_cast<ggml_tensor *>(branch_nodes.front());
+                    current_node_idx++;
+                    branch_nodes.erase(branch_nodes.begin());
+
+                    // append all empty nodes
+                    while (!branch_nodes.empty() && is_noop(branch_nodes.front())) {
+                        cgraph->nodes[current_node_idx] = const_cast<ggml_tensor *>(branch_nodes.front());
+                        current_node_idx++;
+                        branch_nodes.erase(branch_nodes.begin());
+                    }
+
+                    current_branch_idx = (current_branch_idx + 1) % n_branches;
+                }
+            }
+        }
+    }
 }
 
 /**
@@ -2594,7 +2919,7 @@ static const ggml_backend_i ggml_backend_cann_interface = {
     /* .graph_compute           = */ ggml_backend_cann_graph_compute,
     /* .event_record            = */ ggml_backend_cann_event_record,
     /* .event_wait              = */ ggml_backend_cann_event_wait,
-    /* .graph_optimize          = */ NULL,
+    /* .graph_optimize          = */ ggml_backend_cann_graph_optimize,
 };
 
 /**
